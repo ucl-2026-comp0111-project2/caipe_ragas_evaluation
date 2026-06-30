@@ -613,7 +613,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size", type=int, default=100, help="Documents per /v1/ingest request"
     )
-    parser.add_argument("--num-queries", type=int, default=0)
+    parser.add_argument("--num-queries", type=int, default=5)
     parser.add_argument("--query-limit", type=int, default=3)
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--skip-ingest", action="store_true")
