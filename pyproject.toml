@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ragas-eval"
+version = "0.1.0"
+description = "CAIPE Ragas Evaluation Suite for Enterprise RAG pipelines"
+requires-python = ">=3.9"
+dependencies = [
+    "ragas[all]==0.3.5",
+    "openai>=1.0.0",
+    "langchain-community<0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["ragas_eval"]
+
+[tool.uv]
+managed = true
+# Note: When developing locally, use:
+# uv sync --override ragas@path/to/ragas
+
+[tool.pyright]
+extraPaths = [
+    ".",
+    "../",
+    "rag_eval"
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.20",
+]
