@@ -437,7 +437,7 @@ def test_main_workflow():
     mock_args = argparse.Namespace(
         rag_url="http://localhost:8000",
         sources=["confluence"],
-        limit=5,
+        limit_per_source=5,
         datasource_id="test_ds",
         datasource_name="test_ds_name",
         batch_size=10,
@@ -489,7 +489,7 @@ def test_main_workflow_negative():
     mock_args = argparse.Namespace(
         rag_url="http://localhost:8000",
         sources=["confluence"],
-        limit=5,
+        limit_per_source=5,
         datasource_id="test_ds",
         datasource_name="test_ds_name",
         batch_size=10,
@@ -608,13 +608,13 @@ def test_process_zip_file_additional(tmp_path):
 def test_parse_args_additional():
     """Test _parse_args parses command line args."""
     # Positive: normal parameters
-    with mock.patch("sys.argv", ["script", "--limit", "10"]):
+    with mock.patch("sys.argv", ["script", "--limit-per-source", "10"]):
         args = ingest._parse_args()
-        assert args.limit == 10
+        assert args.limit_per_source == 10
         assert args.reset is False
 
     # Negative: system exit on invalid argument type
-    with mock.patch("sys.argv", ["script", "--limit", "abc"]), pytest.raises(SystemExit):
+    with mock.patch("sys.argv", ["script", "--limit-per-source", "abc"]), pytest.raises(SystemExit):
         ingest._parse_args()
 
 
@@ -701,7 +701,7 @@ def test_run_ingestion_job_negative():
 
 def test_run_skip_ingestion_path_negative():
     """Test _run_skip_ingestion_path when question fetching fails."""
-    args = argparse.Namespace(prioritize_reference=False, cache_dir="cache", limit=10)
+    args = argparse.Namespace(prioritize_reference=False, cache_dir="cache", limit_per_source=10)
     # Negative: fetch_documents fails
     with mock.patch("ragas_eval.enterprise_rag_bench_ingest.fetch_documents", side_effect=requests.exceptions.HTTPError("Fetch failed")):
         with pytest.raises(requests.exceptions.HTTPError):

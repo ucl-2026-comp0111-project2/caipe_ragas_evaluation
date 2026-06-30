@@ -606,7 +606,10 @@ def _parse_args() -> argparse.Namespace:
         help="Source types to ingest (default: confluence jira — highest reference-doc frequency)",
     )
     parser.add_argument(
-        "--limit", type=int, default=300000, help="Max documents per source type"
+        "--limit-per-source",
+        type=int,
+        default=300000,
+        help="Max documents per source type",
     )
     parser.add_argument("--datasource-id", default="enterprise_rag_bench")
     parser.add_argument("--datasource-name", default="Enterprise RAG Bench")
@@ -747,7 +750,7 @@ def _run_ingestion_job(
     logger.info(f"Fetching documents from EnterpriseRAG-Bench ({sources})...")
     raw_docs = fetch_documents(
         sources,
-        args.limit,
+        args.limit_per_source,
         cache_dir=args.cache_dir,
         reference_doc_ids=reference_doc_ids,
     )
@@ -841,7 +844,7 @@ def _run_skip_ingestion_path(
     )
     raw_docs = fetch_documents(
         sources,
-        args.limit,
+        args.limit_per_source,
         cache_dir=args.cache_dir,
         reference_doc_ids=reference_doc_ids,
     )
@@ -861,7 +864,7 @@ def main() -> None:
     logger.info(f"RAG server  : {args.rag_url}")
     logger.info(f"Datasource  : {args.datasource_id}")
     logger.info(f"Sources     : {sources}")
-    logger.info(f"Limit/source: {args.limit}")
+    logger.info(f"Limit/source: {args.limit_per_source}")
 
     logger.info("Loading benchmark questions...")
     all_questions = fetch_all_questions()
