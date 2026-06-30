@@ -707,3 +707,33 @@ def test_run_skip_ingestion_path_negative():
         with pytest.raises(requests.exceptions.HTTPError):
             ingest._run_skip_ingestion_path(args, ["jira"], set())
 
+
+def test_fetch_documents_limit(tmp_path):
+    """Test that fetch_documents slices the documents for each source type to limit_per_source."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    
+    # Create two slices with 2 documents each
+    for source in ["confluence", "jira"]:
+        zip_file = cache_dir / f"{source}_slice_0001.zip"
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr(f"{source}/dsid_1__doc-1.txt", f"Title 1 {source}\nContent 1 {source}")
+            zf.writestr(f"{source}/dsid_2__doc-2.txt", f"Title 2 {source}\nContent 2 {source}")
+        with open(zip_file, "wb") as f:
+            f.write(zip_buffer.getvalue())
+            
+    with mock.patch.dict(ingest.SOURCE_SLICE_COUNTS, {"confluence": 1, "jira": 1}, clear=True):
+        # limit_per_source = 1
+        docs = ingest.fetch_documents(
+            source_types=["confluence", "jira"],
+            limit_per_source=1,
+            cache_dir=str(cache_dir)
+        )
+    # Since limit_per_source=1, we should get exactly 1 doc from confluence and 1 doc from jira
+    assert len(docs) == 2
+    confluence_docs = [d for d in docs if d["source_type"] == "confluence"]
+    jira_docs = [d for d in docs if d["source_type"] == "jira"]
+    assert len(confluence_docs) == 1
+    assert len(jira_docs) == 1
+
