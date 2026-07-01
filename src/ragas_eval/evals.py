@@ -9,7 +9,7 @@ import time
 import logging
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, cast, Optional
+from typing import List, Dict, Any, cast, Optional, Tuple
 import argparse
 
 
@@ -29,7 +29,9 @@ from ragas.metrics import (  # noqa: E402
     AnswerRelevancy,
     ContextPrecision,
     ContextRecall,
+    SemanticSimilarity,
 )
+from ragas_eval.metrics import ContainsAnswer  # noqa: E402
 
 # Add the current directory to the path so we can import rag module when run as a script
 sys.path.insert(0, str(Path(__file__).parent))
@@ -544,6 +546,8 @@ def load_configuration(args) -> Dict[str, Any]:
         or settings.rag_eval_retrieval_only,
         "rag_eval_generation_only": args.generation_only
         or settings.rag_eval_generation_only,
+        "rag_eval_short_answer": getattr(args, "short_answer", False)
+        or settings.rag_eval_short_answer,
         "compute_model_eval": getattr(args, "compute_model_eval", False),
     }
     return config
@@ -571,6 +575,9 @@ def _resolve_and_sync_config(args_or_config: Any) -> Dict[str, Any]:
     ).lower()
     os.environ["RAG_EVAL_GENERATION_ONLY"] = str(
         config["rag_eval_generation_only"]
+    ).lower()
+    os.environ["RAG_EVAL_SHORT_ANSWER"] = str(
+        config.get("rag_eval_short_answer", False)
     ).lower()
     return config
 
@@ -693,9 +700,15 @@ def _configure_ragas_llm_args(ragas_llm: Any, model_name: str) -> None:
 def _init_metrics(
     config: Dict[str, Any], ragas_llm: Any, ragas_embeddings: Any
 ) -> List[Any]:
-    """Initialize standard Ragas metrics based on retrieval_only or generation_only configurations."""
+    """Initialize Ragas metrics based on run mode flags.
+
+    Pass --short-answer for HotpotQA-style datasets with single-word/phrase references.
+    This replaces FactualCorrectness + ContextPrecision (which rely on NLI claim extraction
+    and produce 0.0 on short references) with SemanticSimilarity + ContainsAnswer.
+    """
     retrieval_only = config["rag_eval_retrieval_only"]
     generation_only = config["rag_eval_generation_only"]
+    short_answer = config.get("rag_eval_short_answer", False)
 
     if retrieval_only:
         return [
@@ -703,9 +716,23 @@ def _init_metrics(
             ContextRecall(llm=ragas_llm),
         ]
     if generation_only:
+        if short_answer:
+            return [
+                SemanticSimilarity(embeddings=ragas_embeddings),
+                ContainsAnswer(),
+                AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
+            ]
         return [
             FactualCorrectness(llm=ragas_llm),
             AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
+        ]
+    if short_answer:
+        return [
+            SemanticSimilarity(embeddings=ragas_embeddings),
+            ContainsAnswer(),
+            Faithfulness(llm=ragas_llm),
+            AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
+            ContextRecall(llm=ragas_llm),
         ]
     return [
         FactualCorrectness(llm=ragas_llm),
@@ -776,6 +803,27 @@ def load_enterprise_rag_bench(jsonl_path: Path) -> list[dict[str, Any]]:
     return data_samples
 
 
+def load_hotpotqa(jsonl_path: Path) -> list[dict[str, Any]]:
+    """Loads dataset from hotpotqa_questions.jsonl"""
+    data_samples = []
+    if jsonl_path.exists():
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                data_samples.append(
+                    {
+                        "question": item["user_input"],
+                        "user_input": item["user_input"],
+                        "reference": item["reference"],
+                        "expected_doc_ids": item.get("expected_doc_ids", []),
+                        "category": item.get("category", "basic"),
+                    }
+                )
+    return data_samples
+
+
 def load_mock_dataset() -> list[dict[str, Any]]:
     """Loads a mock/fallback dataset for simple testing"""
     return [
@@ -814,11 +862,21 @@ def _load_samples_from_source(
             raise FileNotFoundError(f"Questions file not found: {jsonl_path}")
         return load_enterprise_rag_bench(jsonl_path)
 
+    if datasource_type == "hotpotqa":
+        if not questions_path:
+            raise ValueError(
+                "questions_path must be specified when using hotpotqa datasource."
+            )
+        jsonl_path = Path(questions_path)
+        if not jsonl_path.exists():
+            raise FileNotFoundError(f"Questions file not found: {jsonl_path}")
+        return load_hotpotqa(jsonl_path)
+
     if datasource_type == "mock":
         return load_mock_dataset()
 
     raise ValueError(
-        f"Unsupported datasource: {datasource_type!r}. Only 'enterprise_rag_bench' or 'mock' is supported."
+        f"Unsupported datasource: {datasource_type!r}. Only 'enterprise_rag_bench', 'hotpotqa', or 'mock' is supported."
     )
 
 
@@ -991,18 +1049,23 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use PrecomputedRAG to evaluate pre-existing model answers and contexts in the datasource",
     )
+    parser.add_argument(
+        "--short-answer",
+        action="store_true",
+        help="Use SemanticSimilarity + ContainsAnswer (for HotpotQA-style short-answer datasets)",
+    )
     return parser.parse_args()
 
 
 def _validate_questions_path(config: Dict[str, Any]) -> None:
-    """Validate path if using enterprise_rag_bench or model evaluation is enabled."""
+    """Validate path if using enterprise_rag_bench, hotpotqa or model evaluation is enabled."""
     datasource_type = config["ragas_datasource"].lower()
-    if datasource_type == "enterprise_rag_bench" or config["compute_model_eval"]:
+    if datasource_type in ("enterprise_rag_bench", "hotpotqa") or config["compute_model_eval"]:
         questions_path = config["questions_path"]
         if not questions_path:
             raise ValueError(
                 "questions_path must be specified (via CLI --questions-path or env QUESTIONS_PATH) "
-                "when using enterprise_rag_bench or compute_model_eval."
+                "when using enterprise_rag_bench, hotpotqa or compute_model_eval."
             )
         path_obj = Path(questions_path)
         if not path_obj.exists():
@@ -1078,8 +1141,11 @@ def _run_evaluation(
     return metric_names
 
 
-def _analyze_failures(df: pd.DataFrame) -> float:
-    """Label failure causes and compute retrieval recall statistics."""
+def _analyze_failures(df: pd.DataFrame) -> Tuple[float, float]:
+    """Label failure causes and compute retrieval recall and precision statistics."""
+    if df.empty:
+        return 0.0, 0.0
+
     df["failure_cause"] = "none"
     if "factual_correctness" in df.columns:
         df.loc[df["factual_correctness"] < 0.5, "failure_cause"] = (
@@ -1091,43 +1157,56 @@ def _analyze_failures(df: pd.DataFrame) -> float:
         df.loc[df["context_recall"] < 0.5, "failure_cause"] = "poor_retrieval"
 
     recalls = []
+    precisions = []
     for _, r in df.iterrows():
         expected = set(r.get("expected_doc_ids") or [])
         retrieved = set(r.get("retrieved_doc_ids") or [])
         if expected:
             hit = expected & retrieved
             recall = len(hit) / len(expected)
+            precision = len(hit) / len(retrieved) if retrieved else 0.0
             recalls.append(recall)
+            precisions.append(precision)
         else:
             recalls.append(None)
+            precisions.append(None)
     df["retrieval_recall"] = recalls
+    df["retrieval_precision"] = precisions
     valid_recalls = [r for r in recalls if r is not None]
-    return sum(valid_recalls) / len(valid_recalls) if valid_recalls else 0.0
+    valid_precisions = [p for p in precisions if p is not None]
+    
+    avg_recall = sum(valid_recalls) / len(valid_recalls) if valid_recalls else 0.0
+    avg_precision = sum(valid_precisions) / len(valid_precisions) if valid_precisions else 0.0
+    return avg_recall, avg_precision
 
 
 def _log_metrics_summary(
-    args: argparse.Namespace,
+    config: Dict[str, Any],
     df: pd.DataFrame,
     metric_names: List[str],
     avg_recall: float,
+    avg_precision: float,
 ) -> None:
     """Log configuration and summary metrics."""
-    config_args = {
-        k: v for k, v in vars(args).items() if v is not None and k != "openai_api_key"
-    }
+    keys_to_print = [
+        "rag_eval_top_k",
+        "rag_eval_retrieval_only",
+        "rag_eval_generation_only",
+        "limit_per_category",
+        "compute_model_eval",
+        "rag_eval_short_answer",
+    ]
 
     logger.info("\n--- RUN CONFIGURATION ---")
-    for k, v in config_args.items():
-        logger.info(f"{k}: {v}")
+    for k in keys_to_print:
+        if k in config:
+            print_key = k.replace("rag_eval_", "")
+            logger.info(f"{print_key}: {config[k]}")
 
     logger.info("\n--- OPERATIONAL BEHAVIOR ---")
     logger.info(f"P50 Latency: {df['latency'].median():.2f}s")
     logger.info(f"P95 Latency: {df['latency'].quantile(0.95):.2f}s")
     logger.info(f"Average Tokens: {df['total_tokens'].mean():.1f}")
-
-    valid_recalls = [r for r in df["retrieval_recall"] if r is not None]
-    if valid_recalls:
-        logger.info(f"Average Retrieval Recall: {avg_recall:.2f}")
 
     total_ragas_tokens = ragas_prompt_tokens + ragas_completion_tokens
     logger.info("Ragas Evaluator LLM Token Usage:")
@@ -1139,6 +1218,14 @@ def _log_metrics_summary(
     for m in metric_names:
         logger.info(f"Average {m}: {df[m].mean():.2f}")
 
+    valid_recalls = [r for r in df["retrieval_recall"] if r is not None]
+    if valid_recalls:
+        logger.info(f"Average retrieval_recall: {avg_recall:.2f}")
+
+    valid_precisions = [p for p in df["retrieval_precision"] if p is not None]
+    if valid_precisions:
+        logger.info(f"Average retrieval_precision: {avg_precision:.2f}")
+
     logger.info("\n--- FAILURE CAUSE ANALYSIS ---")
     logger.info(f"\n{df['failure_cause'].value_counts()}")
 
@@ -1148,6 +1235,7 @@ async def _save_evaluation_outputs(
     df: pd.DataFrame,
     metric_names: List[str],
     avg_recall: float,
+    avg_precision: float,
     config_args: Dict[str, Any],
 ) -> None:
     """Save the results DataFrame to CSV and companion JSON summary asynchronously."""
@@ -1163,6 +1251,7 @@ async def _save_evaluation_outputs(
     for m in metric_names:
         summary_row[m] = df[m].mean()
     summary_row["retrieval_recall"] = avg_recall
+    summary_row["retrieval_precision"] = avg_precision
     summary_row["failure_cause"] = "N/A"
 
     df_with_summary = pd.concat([df, pd.DataFrame([summary_row])], ignore_index=True)
@@ -1176,8 +1265,13 @@ async def _save_evaluation_outputs(
         "p50_latency": df["latency"].median(),
         "p95_latency": df["latency"].quantile(0.95),
         "average_tokens": df["total_tokens"].mean(),
-        "metrics": {m: df[m].mean() for m in metric_names},
+        "metrics": {
+            **{m: df[m].mean() for m in metric_names},
+            "retrieval_recall": avg_recall,
+            "retrieval_precision": avg_precision,
+        },
         "average_retrieval_recall": avg_recall,
+        "average_retrieval_precision": avg_precision,
         "ragas_evaluator_usage": {
             "prompt_tokens": ragas_prompt_tokens,
             "completion_tokens": ragas_completion_tokens,
@@ -1191,6 +1285,33 @@ async def _save_evaluation_outputs(
 
     await asyncio.to_thread(save_json)
     logger.info(f"Summary metrics saved to: {summary_json_path.resolve()}")
+
+
+class LegacyEmbeddingsWrapper:
+    """Wrapper class to adapt Ragas embeddings to LangChain-compatible interface expected by legacy metrics."""
+
+    def __init__(self, emb: Any):
+        """Initializes LegacyEmbeddingsWrapper with the underlying embedding model."""
+        self.emb = emb
+
+    def embed_query(self, text: str) -> List[float]:
+        """Embeds a single query string into a vector."""
+        return self.emb.embed_text(text)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embeds a list of document strings into a list of vectors."""
+        return self.emb.embed_texts(texts)
+
+    def embed_text(self, text: str) -> List[float]:
+        """Adapt to modern BaseRagasEmbedding interface."""
+        return self.emb.embed_text(text)
+
+    async def aembed_text(self, text: str) -> List[float]:
+        """Adapt to modern BaseRagasEmbedding async interface, falling back to sync if client lacks async support."""
+        try:
+            return await self.emb.aembed_text(text)
+        except (TypeError, AttributeError):
+            return self.emb.embed_text(text)
 
 
 async def main():
@@ -1224,22 +1345,6 @@ async def main():
     logger.info("\n--- PHASE 2: BATCH EVALUATION VIA RAGAS ---")
     eval_dataset = _prepare_eval_dataset(df)
 
-    # Wrap embeddings to provide LangChain-compatible interface for legacy metrics
-    class LegacyEmbeddingsWrapper:
-        """Wrapper class to adapt Ragas embeddings to LangChain-compatible interface expected by legacy metrics."""
-
-        def __init__(self, emb):
-            """Initializes LegacyEmbeddingsWrapper with the underlying embedding model."""
-            self.emb = emb
-
-        def embed_query(self, text):
-            """Embeds a single query string into a vector."""
-            return self.emb.embed_text(text)
-
-        def embed_documents(self, texts):
-            """Embeds a list of document strings into a list of vectors."""
-            return self.emb.embed_texts(texts)
-
     legacy_embeddings: Any = LegacyEmbeddingsWrapper(ragas_embeddings)
 
     # Run batch evaluation smoothly outside of active async worker threads
@@ -1252,9 +1357,9 @@ async def main():
         ragas_llm_obj=ragas_llm,
     )
 
-    avg_recall = _analyze_failures(df)
+    avg_recall, avg_precision = _analyze_failures(df)
 
-    _log_metrics_summary(args, df, metric_names, avg_recall)
+    _log_metrics_summary(config, df, metric_names, avg_recall, avg_precision)
 
     config_args = {
         k: v for k, v in vars(args).items() if v is not None and k != "openai_api_key"
@@ -1265,8 +1370,16 @@ async def main():
         df=df,
         metric_names=metric_names,
         avg_recall=avg_recall,
+        avg_precision=avg_precision,
         config_args=config_args,
     )
+
+    # Rename the dataset CSV to match the experiment name
+    old_dataset_path = Path("evals") / "datasets" / "test_dataset.csv"
+    if old_dataset_path.exists():
+        new_dataset_path = Path("evals") / "datasets" / f"{experiment_results.name}.csv"
+        await asyncio.to_thread(old_dataset_path.rename, new_dataset_path)
+        logger.info(f"Dataset renamed to match experiment: {new_dataset_path.resolve()}")
 
 
 if __name__ == "__main__":

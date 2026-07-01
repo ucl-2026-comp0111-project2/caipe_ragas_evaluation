@@ -1,9 +1,14 @@
 import argparse
 import pytest
 import json
+import asyncio
+import os
 import pandas as pd
 import unittest.mock as mock
+from pathlib import Path
 from ragas_eval import evals
+from ragas_eval.metrics import ContainsAnswer, _normalize
+from ragas.dataset_schema import SingleTurnSample
 
 
 def test_sanitize_kwargs():
@@ -413,10 +418,26 @@ def test_load_mock_dataset():
     assert len(mock_data) > 0
 
 
-def test_load_samples_from_source():
+def test_load_samples_from_source(tmp_path):
     # Positive: mock
     samples = evals._load_samples_from_source("mock", "")
     assert len(samples) > 0
+
+    # Positive: hotpotqa
+    jsonl_file = tmp_path / "hotpotqa_questions.jsonl"
+    data = [
+        {
+            "user_input": "Q1",
+            "reference": "Ref1",
+            "expected_doc_ids": ["doc1"],
+            "category": "cat1",
+        }
+    ]
+    with open(jsonl_file, "w") as f:
+        f.write(json.dumps(data[0]) + "\n")
+    samples = evals._load_samples_from_source("hotpotqa", str(jsonl_file))
+    assert len(samples) == 1
+    assert samples[0]["question"] == "Q1"
 
     # Negative: invalid source type returns empty list
     with pytest.raises(ValueError, match="Unsupported datasource"):
@@ -463,6 +484,15 @@ def test_validate_questions_path():
             }
         )
 
+    with pytest.raises(ValueError, match="questions_path must be specified"):
+        evals._validate_questions_path(
+            {
+                "ragas_datasource": "hotpotqa",
+                "compute_model_eval": True,
+                "questions_path": "",
+            }
+        )
+
 
 def test_prepare_eval_dataset():
     # Positive
@@ -497,22 +527,552 @@ def test_analyze_failures():
             "retrieved_doc_ids": [["doc1"], []],
         }
     )
-    avg_recall = evals._analyze_failures(df)
+    avg_recall, avg_precision = evals._analyze_failures(df)
     assert avg_recall == 0.5
+    assert avg_precision == 0.5
 
-    # Negative: empty DataFrame returns 0.0
-    assert evals._analyze_failures(pd.DataFrame()) == 0.0
+    # Negative: empty DataFrame returns (0.0, 0.0)
+    assert evals._analyze_failures(pd.DataFrame()) == (0.0, 0.0)
 
 
 def test_log_metrics_summary():
     # Positive
-    args = argparse.Namespace(limit=10)
+    config = {
+        "rag_eval_top_k": 5,
+        "rag_eval_retrieval_only": False,
+        "rag_eval_generation_only": False,
+        "limit_per_category": 10,
+        "compute_model_eval": False,
+        "rag_eval_short_answer": True,
+    }
     df = pd.DataFrame(
         {
             "latency": [1.0],
             "total_tokens": [100],
             "retrieval_recall": [1.0],
+            "retrieval_precision": [1.0],
             "failure_cause": ["none"],
         }
     )
-    evals._log_metrics_summary(args, df, [], 1.0)
+    evals._log_metrics_summary(config, df, [], 1.0, 1.0)
+
+
+def test_log_metrics_summary_negative():
+    # Negative: Missing required columns raises KeyError
+    config = {
+        "rag_eval_top_k": 5,
+    }
+    df = pd.DataFrame(
+        {
+            "some_other_column": [1.0],
+        }
+    )
+    with pytest.raises(KeyError):
+        evals._log_metrics_summary(config, df, [], 1.0, 1.0)
+
+
+def test_save_evaluation_outputs_positive(tmp_path):
+    # Positive
+    df = pd.DataFrame(
+        {
+            "question": ["q1"],
+            "latency": [1.0],
+            "total_tokens": [100],
+            "retrieval_recall": [1.0],
+            "retrieval_precision": [1.0],
+            "failure_cause": ["none"],
+        }
+    )
+    # Mock output directory to save inside tmp_path
+    (tmp_path / "evals").mkdir()
+    with mock.patch("ragas_eval.evals.Path") as mock_path:
+        mock_path.return_value = tmp_path
+        mock_path.side_effect = lambda *args: Path(tmp_path, *args)
+
+        asyncio.get_event_loop().run_until_complete(
+            evals._save_evaluation_outputs(
+                experiment_name="test_exp",
+                df=df,
+                metric_names=[],
+                avg_recall=1.0,
+                avg_precision=1.0,
+                config_args={"limit": 10},
+            )
+        )
+
+        # Verify files are created
+        csv_file = tmp_path / "evals" / "experiments" / "test_exp.csv"
+        json_file = tmp_path / "evals" / "experiments" / "test_exp_summary.json"
+        assert csv_file.exists()
+        assert json_file.exists()
+
+        # Load and verify JSON contents
+        with open(json_file, "r") as f:
+            data = json.load(f)
+        assert data["average_retrieval_recall"] == 1.0
+        assert data["average_retrieval_precision"] == 1.0
+        assert data["metrics"]["retrieval_recall"] == 1.0
+        assert data["metrics"]["retrieval_precision"] == 1.0
+
+
+def test_save_evaluation_outputs_negative():
+    # Negative: empty DataFrame or missing columns raises KeyError
+    df = pd.DataFrame()
+    with pytest.raises(KeyError):
+        asyncio.get_event_loop().run_until_complete(
+            evals._save_evaluation_outputs(
+                experiment_name="test_exp_fail",
+                df=df,
+                metric_names=[],
+                avg_recall=1.0,
+                avg_precision=1.0,
+                config_args={},
+            )
+        )
+
+
+class TestNormalize:
+    def test_lowercase(self):
+        assert _normalize("YES") == "yes"
+
+    def test_strips_articles(self):
+        assert _normalize("the Chief of Protocol") == "chief of protocol"
+        assert _normalize("a cat and an owl") == "cat and owl"
+
+    def test_strips_punctuation(self):
+        assert _normalize("yes!") == "yes"
+        assert _normalize("Chief of Protocol.") == "chief of protocol"
+
+    def test_collapses_whitespace(self):
+        assert _normalize("  yes   ") == "yes"
+
+    def test_empty_string(self):
+        assert _normalize("") == ""
+
+
+class TestContainsAnswer:
+    metric = ContainsAnswer()
+
+    def _score(self, response: str, reference: str) -> float:
+        sample = SingleTurnSample(
+            user_input="dummy question",
+            response=response,
+            reference=reference,
+        )
+        return asyncio.get_event_loop().run_until_complete(
+            self.metric._single_turn_ascore(sample)
+        )
+
+    def test_exact_match_yes(self):
+        assert self._score("yes", "yes") == 1.0
+
+    def test_verbose_yes_answer(self):
+        # Model gives verbose answer, reference is "yes"
+        assert (
+            self._score(
+                "Yes, both Scott Derrickson and Ed Wood were American directors.",
+                "yes",
+            )
+            == 1.0
+        )
+
+    def test_contains_chief_of_protocol(self):
+        assert (
+            self._score(
+                "Shirley Temple held the position of Chief of Protocol.",
+                "Chief of Protocol",
+            )
+            == 1.0
+        )
+
+    def test_missing_answer(self):
+        # Model says it cannot answer
+        assert (
+            self._score(
+                "Based on the documents, I cannot determine the government position.",
+                "Chief of Protocol",
+            )
+            == 0.0
+        )
+
+    def test_empty_reference_returns_zero(self):
+        assert self._score("some response", "") == 0.0
+
+    def test_empty_response_returns_zero(self):
+        assert self._score("", "yes") == 0.0
+
+    def test_case_insensitive(self):
+        assert self._score("The answer is AMERICAN", "american") == 1.0
+
+    def test_article_stripping(self):
+        # "the Chief of Protocol" normalises to "chief of protocol"
+        assert (
+            self._score(
+                "She served as the Chief of Protocol in Washington.",
+                "Chief of Protocol",
+            )
+            == 1.0
+        )
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Metric validation and fallback tests
+# ---------------------------------------------------------------------------
+def test_contains_answer_validation():
+    """Test that ContainsAnswer metric passes Ragas column validation checks (Positive)."""
+    from ragas.validation import validate_required_columns
+    from ragas.dataset_schema import EvaluationDataset
+    from ragas_eval.metrics import ContainsAnswer
+
+    df = pd.DataFrame(
+        [
+            {
+                "user_input": "q",
+                "response": "a",
+                "reference": "r",
+            }
+        ]
+    )
+    dataset = EvaluationDataset.from_pandas(df)  # type: ignore
+    metric = ContainsAnswer()
+    validate_required_columns(dataset, [metric])
+
+
+def test_contains_answer_validation_negative():
+    """Test that ContainsAnswer metric fails validation if required columns are missing (Negative)."""
+    from ragas.validation import validate_required_columns
+    from ragas.dataset_schema import EvaluationDataset
+    from ragas_eval.metrics import ContainsAnswer
+
+    # Missing "response" column
+    df = pd.DataFrame(
+        [
+            {
+                "user_input": "q",
+                "reference": "r",
+            }
+        ]
+    )
+    dataset = EvaluationDataset.from_pandas(df)  # type: ignore
+    metric = ContainsAnswer()
+    with pytest.raises(ValueError):
+        validate_required_columns(dataset, [metric])
+
+
+def test_legacy_embeddings_wrapper_methods():
+    """Test that LegacyEmbeddingsWrapper forwards methods correctly to underlying embedding (Positive).
+
+    Ragas 0.3.5 embedding clients implement the modern BaseRagasEmbedding interface (using embed_text/embed_texts),
+    whereas legacy metrics (and underlying LangChain elements) expect standard LangChain Embeddings methods
+    (using embed_query/embed_documents). The wrapper must expose both to prevent AttributeError crashes.
+    """
+    from ragas_eval.evals import LegacyEmbeddingsWrapper
+
+    class MockEmbedding:
+        def embed_text(self, text: str) -> list[float]:
+            return [1.0, 2.0]
+
+        def embed_texts(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0, 2.0] for _ in texts]
+
+    mock_emb = MockEmbedding()
+    wrapper = LegacyEmbeddingsWrapper(mock_emb)
+
+    assert wrapper.embed_query("test") == [1.0, 2.0]
+    assert wrapper.embed_documents(["test"]) == [[1.0, 2.0]]
+    assert wrapper.embed_text("test") == [1.0, 2.0]
+
+
+def test_legacy_embeddings_wrapper_methods_negative():
+    """Test that LegacyEmbeddingsWrapper methods handle empty/invalid values gracefully or throw (Negative)."""
+    from ragas_eval.evals import LegacyEmbeddingsWrapper
+
+    class MockEmbedding:
+        def embed_text(self, text: str) -> list[float]:
+            if not text:
+                raise ValueError("empty text")
+            return [1.0, 2.0]
+
+        def embed_texts(self, texts: list[str]) -> list[list[float]]:
+            if not texts:
+                raise ValueError("empty list")
+            return [[1.0, 2.0] for _ in texts]
+
+    mock_emb = MockEmbedding()
+    wrapper = LegacyEmbeddingsWrapper(mock_emb)
+
+    with pytest.raises(ValueError, match="empty text"):
+        wrapper.embed_query("")
+
+    with pytest.raises(ValueError, match="empty list"):
+        wrapper.embed_documents([])
+
+
+@pytest.mark.anyio
+async def test_legacy_embeddings_wrapper_aembed_standard():
+    """Test that aembed_text succeeds immediately if the client is asynchronous (Positive)."""
+    from ragas_eval.evals import LegacyEmbeddingsWrapper
+
+    class AsyncMockEmbedding:
+        async def aembed_text(self, text: str) -> list[float]:
+            return [3.0, 4.0]
+
+    mock_emb = AsyncMockEmbedding()
+    wrapper = LegacyEmbeddingsWrapper(mock_emb)
+    res = await wrapper.aembed_text("test")
+    assert res == [3.0, 4.0]
+
+
+@pytest.mark.anyio
+async def test_legacy_embeddings_wrapper_aembed_fallback():
+    """Test that aembed_text falls back to sync embed_text on TypeError (Negative/Fallback).
+
+    Some embedding models/clients are synchronous and do not support async aembed_text. When evaluated,
+    Ragas attempts to call `aembed_text` on the runner thread which raises TypeError or AttributeError.
+    The wrapper must catch these errors and fall back to synchronous `embed_text` to prevent evaluation crashes.
+    """
+    from ragas_eval.evals import LegacyEmbeddingsWrapper
+
+    class SyncMockEmbedding:
+        def __init__(self):
+            self.embed_called = False
+
+        def embed_text(self, text: str) -> list[float]:
+            self.embed_called = True
+            return [1.0, 2.0]
+
+        async def aembed_text(self, text: str) -> list[float]:
+            raise TypeError("Cannot use aembed_text with a synchronous client.")
+
+    mock_emb = SyncMockEmbedding()
+    wrapper = LegacyEmbeddingsWrapper(mock_emb)
+
+    res = await wrapper.aembed_text("test")
+    assert res == [1.0, 2.0]
+    assert mock_emb.embed_called is True
+
+
+def test_load_hotpotqa(tmp_path):
+    """Test load_hotpotqa parsing logic (Positive)."""
+    from ragas_eval.evals import load_hotpotqa
+
+    jsonl_file = tmp_path / "questions.jsonl"
+    data = [
+        {
+            "user_input": "Q1",
+            "reference": "Ref1",
+            "expected_doc_ids": ["doc1"],
+            "category": "cat1",
+        }
+    ]
+    with open(jsonl_file, "w") as f:
+        f.write(json.dumps(data[0]) + "\n")
+
+    samples = load_hotpotqa(jsonl_file)
+    assert len(samples) == 1
+    assert samples[0]["question"] == "Q1"
+
+
+def test_load_hotpotqa_negative():
+    """Test load_hotpotqa with a non-existent path returns empty list (Negative)."""
+    from pathlib import Path
+    from ragas_eval.evals import load_hotpotqa
+
+    samples = load_hotpotqa(Path("/non/existent/path.jsonl"))
+    assert len(samples) == 0
+
+
+def test_init_metrics_short_answer_positive():
+    """Test _init_metrics returns the short-answer stack when config flag is active (Positive)."""
+    from ragas_eval.evals import _init_metrics
+
+    config = {
+        "rag_eval_retrieval_only": False,
+        "rag_eval_generation_only": False,
+        "rag_eval_short_answer": True,
+    }
+    metrics_list = _init_metrics(config, mock.Mock(), mock.Mock())
+    names = [m.name for m in metrics_list]
+    assert "semantic_similarity" in names
+    assert "contains_answer" in names
+    assert "factual_correctness" not in names
+
+
+def test_init_metrics_short_answer_negative():
+    """Test _init_metrics returns the standard stack when config flag is false (Negative)."""
+    from ragas_eval.evals import _init_metrics
+
+    config = {
+        "rag_eval_retrieval_only": False,
+        "rag_eval_generation_only": False,
+        "rag_eval_short_answer": False,
+    }
+    metrics_list = _init_metrics(config, mock.Mock(), mock.Mock())
+    names = [m.name for m in metrics_list]
+    assert "factual_correctness" in names
+    assert "contains_answer" not in names
+
+
+def test_config_short_answer_resolution_regression():
+    """Regression test: Ensure rag_eval_short_answer resolves correctly from CLI args."""
+    from ragas_eval.evals import load_configuration
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--short-answer", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--datasource", type=str, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--openai-api-key", type=str, default=None)
+    parser.add_argument("--openai-endpoint", type=str, default=None)
+    parser.add_argument("--openai-model-name", type=str, default=None)
+    parser.add_argument("--embeddings-model", type=str, default=None)
+    parser.add_argument("--retrieval-only", action="store_true")
+    parser.add_argument("--generation-only", action="store_true")
+    parser.add_argument("--limit-per-category", type=int, default=None)
+    parser.add_argument("--questions-path", type=str, default=None)
+
+    # CLI flag passed
+    args_true = parser.parse_args(["--short-answer"])
+    config_true = load_configuration(args_true)
+    assert config_true["rag_eval_short_answer"] is True
+
+    # CLI flag absent (uses default/env setting)
+    args_false = parser.parse_args([])
+    config_false = load_configuration(args_false)
+    # Checks that it reads settings.rag_eval_short_answer
+    from ragas_eval.config import settings
+
+    assert config_false["rag_eval_short_answer"] == settings.rag_eval_short_answer
+
+
+def test_config_short_answer_sync_regression():
+    """Regression test: Ensure rag_eval_short_answer synchronizes to os.environ."""
+    from ragas_eval.evals import _resolve_and_sync_config
+    import os
+
+    config = {
+        "questions_path": "data/q.jsonl",
+        "openai_api_key": "k",
+        "openai_endpoint": "http://localhost:4000/v1",
+        "openai_model_name": "m",
+        "embeddings_model": "emb",
+        "caipe_datasource_id": "ds",
+        "ragas_datasource": "hotpotqa",
+        "rag_eval_top_k": 3,
+        "rag_eval_retrieval_only": False,
+        "rag_eval_generation_only": False,
+        "rag_eval_short_answer": True,
+    }
+
+    _resolve_and_sync_config(config)
+    assert os.environ.get("RAG_EVAL_SHORT_ANSWER") == "true"
+
+    config["rag_eval_short_answer"] = False
+    _resolve_and_sync_config(config)
+    assert os.environ.get("RAG_EVAL_SHORT_ANSWER") == "false"
+
+
+def test_load_dataset_and_rename_file():
+    """Test that load_dataset creates test_dataset.csv and it gets renamed correctly."""
+    old_file = Path("evals") / "datasets" / "test_dataset.csv"
+    new_file = Path("evals") / "datasets" / "test_experiment_name.csv"
+    
+    # Ensure starting clean
+    for f in [old_file, new_file]:
+        if f.exists():
+            f.unlink()
+
+    samples = [{"question": "q1", "category": "c1"}]
+    with mock.patch("ragas_eval.evals._load_samples_from_source", return_value=samples):
+        try:
+            # 1. Load dataset (saves as test_dataset.csv)
+            evals.load_dataset(
+                limit=1,
+                datasource="hotpotqa",
+                limit_per_category=None,
+                questions_path="dummy.jsonl"
+            )
+            assert old_file.exists()
+            
+            # 2. Simulate renaming logic in main()
+            experiment_name = "test_experiment_name"
+            if old_file.exists():
+                renamed_path = Path("evals") / "datasets" / f"{experiment_name}.csv"
+                old_file.rename(renamed_path)
+                
+            assert not old_file.exists()
+            assert new_file.exists()
+            
+        finally:
+            # Clean up files
+            for f in [old_file, new_file]:
+                if f.exists():
+                    f.unlink()
+
+def test_config_resolution_and_priority():
+    """Verify that environment variables are loaded, CLI args take priority, and output printing is correct."""
+    from ragas_eval.evals import load_configuration, _log_metrics_summary
+    
+    # 1. Test Env Var resolution
+    with mock.patch.dict(os.environ, {"RAG_EVAL_SHORT_ANSWER": "true", "QUESTIONS_PATH": "env_q.jsonl"}):
+        from ragas_eval.config import Settings
+        # Re-initialize Settings to reload from env
+        mock_settings = Settings()
+        with mock.patch("ragas_eval.evals.settings", mock_settings):
+            args = argparse.Namespace(
+                questions_path=None,
+                datasource="hotpotqa",
+                top_k=None,
+                openai_api_key=None,
+                openai_endpoint=None,
+                openai_model_name=None,
+                embeddings_model=None,
+                retrieval_only=False,
+                generation_only=False,
+                limit_per_category=None,
+                limit=None,
+                short_answer=False,
+            )
+            config = load_configuration(args)
+            assert config["rag_eval_short_answer"] is True
+            assert config["questions_path"] == "env_q.jsonl"
+            
+    # 2. Test CLI Override Priority
+    with mock.patch.dict(os.environ, {"RAG_EVAL_SHORT_ANSWER": "false"}):
+        mock_settings = Settings()
+        with mock.patch("ragas_eval.evals.settings", mock_settings):
+            args = argparse.Namespace(
+                questions_path="cli_q.jsonl",
+                datasource="hotpotqa",
+                top_k=5,
+                openai_api_key=None,
+                openai_endpoint=None,
+                openai_model_name=None,
+                embeddings_model=None,
+                retrieval_only=False,
+                generation_only=False,
+                limit_per_category=None,
+                limit=None,
+                short_answer=True,
+            )
+            config = load_configuration(args)
+            assert config["rag_eval_short_answer"] is True
+            assert config["questions_path"] == "cli_q.jsonl"
+
+    # 3. Test Printing
+    df = pd.DataFrame({
+        "latency": [1.0],
+        "total_tokens": [100],
+        "retrieval_recall": [1.0],
+        "retrieval_precision": [1.0],
+        "failure_cause": ["none"],
+    })
+    with mock.patch("ragas_eval.evals.logger") as mock_logger:
+        _log_metrics_summary(config, df, [], 1.0, 1.0)
+        # Verify that logger.info was called with config values
+        mock_logger.info.assert_any_call("short_answer: True")
+        mock_logger.info.assert_any_call("top_k: 5")
+
+

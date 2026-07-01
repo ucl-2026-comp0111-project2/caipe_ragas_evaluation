@@ -309,6 +309,36 @@ def test_load_dataset_invalid():
         evals.load_dataset(datasource="invalid_source")
 
 
+def test_load_dataset_hotpotqa(tmp_path):
+    """Test that load_dataset correctly loads hotpotqa datasource questions."""
+    jsonl_file = tmp_path / "hotpotqa_questions.jsonl"
+    data = [
+        {
+            "user_input": "Q1",
+            "reference": "Ref1",
+            "expected_doc_ids": ["doc1"],
+            "category": "cat1",
+        }
+    ]
+    with open(jsonl_file, "w") as f:
+        for item in data:
+            f.write(json.dumps(item) + "\n")
+
+    with mock.patch("ragas_eval.evals.Dataset") as mock_dataset_class:
+        mock_dataset = mock.Mock()
+        mock_dataset_class.return_value = mock_dataset
+
+        evals.load_dataset(
+            limit=None,
+            datasource="hotpotqa",
+            limit_per_category=None,
+            questions_path=str(jsonl_file),
+        )
+
+        mock_dataset.save.assert_called_once()
+        assert mock_dataset.append.call_count == 1
+
+
 @pytest.mark.asyncio
 async def test_run_experiment_retrieval_only():
     """Test that run_experiment yields 'N/A' response and returns retrieved contexts when retrieval_only is enabled."""
