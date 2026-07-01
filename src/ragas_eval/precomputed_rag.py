@@ -121,8 +121,10 @@ class PrecomputedRAG:
             print(f"WARNING: No precomputed data found for query: {query!r}")
             return []
 
-        # 2. Use the reference (ideal answer) to retrieve the docs from CaipeRetriever
-        reference_query = data["reference"]
+        # 2. Use a combined query of question + reference to retrieve relevant docs from CAIPE.
+        # This leverages the semantic context from both, which works for both long-form references
+        # and short factual answers (e.g. HotpotQA "yes"/"no").
+        reference_query = f"{data['question']} {data['reference']}".strip()
 
         logger.info(f"Retrieving documents using reference query: {reference_query[:100]}...")
         print(f"Retrieving documents using reference query: {reference_query[:100]}...")

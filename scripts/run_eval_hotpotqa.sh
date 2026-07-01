@@ -10,6 +10,12 @@ if [ -f .env ]; then
   set +a
 fi
 
+# Override configuration variables for HotpotQA
+export CAIPE_DATASOURCE_ID="hotpotqa_sample"
+export RAGAS_DATASOURCE="hotpotqa"
+export QUESTIONS_PATH="data/hotpotqa_full_questions.jsonl"
+export RAG_EVAL_SHORT_ANSWER="true"
+
 # Fetch OIDC credentials from Kubernetes
 # Assumption: CAIPE is deployed using KinD (Kubernetes in Docker) with OIDC enabled.
 # The credentials (Client ID and Secret) are fetched directly from the Kubernetes cluster secret 'rag-ingestor-secret' in the 'caipe' namespace.
@@ -25,5 +31,11 @@ export CAIPE_OIDC_TOKEN=$(curl -s -X POST "http://localhost:7080/realms/caipe/pr
 # Ensure src/ is in the PYTHONPATH so python can find the package
 export PYTHONPATH=src:$PYTHONPATH
 
-# Run the ingestion script passing through any CLI arguments
-uv run python3 -m ragas_eval.hotpotqa_rag_ingest --limit-per-category 1000 --input-file data/hotpotqa_full_document_pool.jsonl --prioritize-reference "$@"
+# Run evaluation. Add flags as needed:
+#   --short-answer          Use SemanticSimilarity + ContainsAnswer (for HotpotQA-style short-answer datasets)
+#   --retrieval-only        Measure context_precision + context_recall only
+#   --generation-only       Measure answer quality only (skip context metrics)
+#   --compute-model-eval    Evaluate pre-existing model answers from the datasource
+#   --limit-per-category N  Limit questions per category
+#   --top-k N               Number of documents to retrieve
+uv run python3 -m ragas_eval.evals --limit-per-category 10 --top-k 5 --short-answer

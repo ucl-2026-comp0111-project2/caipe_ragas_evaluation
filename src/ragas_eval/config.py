@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     rag_eval_top_k: int = Field(default=3)
     rag_eval_retrieval_only: bool = Field(default=False)
     rag_eval_generation_only: bool = Field(default=False)
+    rag_eval_short_answer: bool = Field(default=False)
     limit_per_category: Optional[int] = Field(default=None)
 
 
