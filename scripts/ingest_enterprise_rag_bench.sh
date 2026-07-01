@@ -26,4 +26,4 @@ export CAIPE_OIDC_TOKEN=$(curl -s -X POST "http://localhost:7080/realms/caipe/pr
 export PYTHONPATH=src:$PYTHONPATH
 
 # Run the ingestion script passing through any CLI arguments
-uv run python -m ragas_eval.enterprise_rag_bench_ingest --limit-per-source 1000 "$@"
+uv run python3 -m ragas_eval.enterprise_rag_bench_ingest --limit-per-source 1000 "$@"

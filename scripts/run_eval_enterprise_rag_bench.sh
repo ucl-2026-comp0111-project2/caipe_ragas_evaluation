@@ -10,6 +10,12 @@ if [ -f .env ]; then
   set +a
 fi
 
+# Override configuration variables for Enterprise RAG Bench
+export CAIPE_DATASOURCE_ID="enterprise_rag_bench"
+export RAGAS_DATASOURCE="enterprise_rag_bench"
+export QUESTIONS_PATH="data/enterprise_rag_bench_questions.jsonl"
+export RAG_EVAL_SHORT_ANSWER="false"
+
 # Fetch OIDC credentials from Kubernetes
 # Assumption: CAIPE is deployed using KinD (Kubernetes in Docker) with OIDC enabled.
 # The credentials (Client ID and Secret) are fetched directly from the Kubernetes cluster secret 'rag-ingestor-secret' in the 'caipe' namespace.

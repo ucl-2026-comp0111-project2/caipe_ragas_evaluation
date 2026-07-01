@@ -23,4 +23,4 @@ export CAIPE_OIDC_TOKEN=$(curl -s -X POST "http://localhost:7080/realms/caipe/pr
 # Ensure src/ is in the PYTHONPATH so python can find the package
 export PYTHONPATH=src:$PYTHONPATH
 
-/Users/alexanghh/development/caipe_ragas/.venv/bin/python -m ragas_eval.evals --compute-model-eval --limit 1 --top-k 5
+uv run python3 -m ragas_eval.evals --compute-model-eval --limit 10 --top-k 5
