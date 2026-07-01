@@ -3,21 +3,18 @@
 ## Project Structure
 
 ```
-ai_platform_engineering/   # Python backend
-  agents/                  # Sub-agents (GitHub, ArgoCD, etc.)
-  knowledge_bases/rag/     # RAG server, ingestors, graphrag, ontology
-  mcp/                     # MCP (Model Context Protocol) integrations
-  multi_agents/            # Multi-agent orchestration (supervisor, deepagent)
-  utils/                   # Shared utilities
-ui/                        # Next.js frontend
-docs/                      # Documentation site (Docusaurus)
-docker-compose/            # Docker configs for services
-integration/               # Integration tests
-scripts/                   # Utility scripts
-charts/                    # Helm charts
+data/                      # Ingestion datasets and reference document pools
+docs/                      # Technical docs (metrics integration, custom metrics, architectures)
+evals/                     # Saved experiment datasets and JSON summary outputs
+scripts/                   # Execution scripts for ingestion and running evaluations
+src/                       # Core python source code
+  ragas_eval/              # Main package containing evals, metrics, config, and ingestors
+tests/                     # Suite of positive/negative unit tests
+pyproject.toml             # Package dependencies and project definitions
+uv.lock                    # Dependency lockfile
 ```
 
-Each component has its own environment variables - see `env.example` in `ui/` and READMEs in `ai_platform_engineering/knowledge_bases/rag/`.
+Environment variables can be configured using the `.env.example` file located at the root of the project.
 
 ## Documentation
 
@@ -77,6 +74,12 @@ bd sync               # Sync with git
 Before committing code changes, run relevant checks:
 - Python: `uv run ruff check`, `uv run pytest` (always use `uv run` to ensure virtual env)
 - UI: `nvm use` first (if available), then `npm run lint`, `npm run build`
+
+## Testing & TDD Guidelines
+
+- **TDD Adoption** - Adopt Test-Driven Development (TDD) where feasible by writing tests before or alongside implementation.
+- **Mandatory Test Cases** - Always create test cases for each function written (at least one positive and one negative test per function).
+- **Target Coverage** - Maintain high unit test coverage (aiming for at least 80% coverage per file).
 
 ## Code Style
 
