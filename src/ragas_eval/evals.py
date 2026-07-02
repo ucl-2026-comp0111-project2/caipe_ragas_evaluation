@@ -1,5 +1,7 @@
 import os
 import sys
+from ragas_eval.rag import default_rag_client  # noqa: E402
+from ragas_eval.agentic_rag import default_agentic_rag_client  # noqa: E402
 
 # Disable Ragas anonymous telemetry and background thread
 os.environ["RAGAS_DO_NOT_TRACK"] = "true"
@@ -549,6 +551,7 @@ def load_configuration(args) -> Dict[str, Any]:
         "rag_eval_short_answer": getattr(args, "short_answer", False)
         or settings.rag_eval_short_answer,
         "compute_model_eval": getattr(args, "compute_model_eval", False),
+        "agentic": getattr(args, "agentic", False),
     }
     return config
 
@@ -596,9 +599,13 @@ def _init_patched_openai_client(config: Dict[str, Any]) -> tuple[OpenAI, Any]:
 
 
 def _init_rag_client(
-    config: Dict[str, Any], dataset: Optional[Dataset], openai_client: OpenAI
+     config: Dict[str, Any], dataset: Optional[Dataset], openai_client: OpenAI
 ) -> Any:
     """Initialize the RAG client based on compute_model_eval flag."""
+    # Agentic mode: route through caipe-supervisor A2A endpoint
+    if config.get("agentic"):
+        return default_agentic_rag_client(logdir="evals/logs")
+
     if not config["compute_model_eval"]:
         return default_rag_client(
             llm_client=openai_client,
@@ -1053,6 +1060,13 @@ def _parse_args() -> argparse.Namespace:
         "--short-answer",
         action="store_true",
         help="Use SemanticSimilarity + ContainsAnswer (for HotpotQA-style short-answer datasets)",
+    )
+    parser.add_argument(
+        "--agentic",
+        action="store_true",
+        help="Use AgenticRAG — routes queries through caipe-supervisor's A2A endpoint "
+             "instead of rag-server directly. Requires the rag_context patch applied to "
+             "agent.py in your CAIPE instance.",
     )
     return parser.parse_args()
 

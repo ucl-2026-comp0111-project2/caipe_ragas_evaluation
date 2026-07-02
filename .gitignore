@@ -154,3 +154,5 @@ data/
 .vscode/
 *.code-workspace
 
+src/ragas_eval/evals.py.bak
+src/ragas_eval/rag.py.save

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # CAIPE KB Configs
     caipe_datasource_id: str = Field(default="enterprise_rag_bench", validation_alias="caipe_datasource_id")
     caipe_query_endpoint: str = Field(default="http://localhost:9446/v1/query", validation_alias="caipe_query_endpoint")
+    caipe_supervisor_url: str = Field(default="http://localhost:8000", validation_alias="caipe_supervisor_url")
     caipe_oidc_token: Optional[str] = Field(default=None, validation_alias="caipe_oidc_token")
     ragas_datasource: str = Field(default="enterprise_rag_bench")
     questions_path: str = Field(default="", validation_alias="questions_path")
