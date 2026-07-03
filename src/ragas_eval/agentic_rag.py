@@ -1,10 +1,10 @@
 import json
+import hashlib
 import logging
 import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-import traceback
 
 import requests
 
@@ -66,7 +66,25 @@ def _parse_rag_context_artifact(text: str) -> list:
             for item in data.get(key, []) or []:
                 txt = item.get("text_content")
                 if txt:
-                    out.append((clean_snippet_markdown(txt), None))
+                    # Extract document_id from the search metadata block where available.
+                    meta = (
+                        item.get("metadata", {})
+                        if isinstance(item.get("metadata"), dict)
+                        else {}
+                    )
+                    doc_id = (
+                        meta.get("document_id")
+                        or meta.get("doc_id")
+                        or item.get("document_id")
+                    )
+                    # Convert to string before appending so doc IDs are consistently typed.
+                    resolved_id = str(doc_id) if doc_id is not None else None
+                    out.append((clean_snippet_markdown(txt), resolved_id))
+                    logger.info(
+                        "Snippet: %s | DocID: %s",
+                        clean_snippet_markdown(txt),
+                        resolved_id,
+                    )
     elif isinstance(data, list):
         for item in data:
             doc = item.get("document", {}) if isinstance(item, dict) else {}
@@ -148,8 +166,21 @@ class AgenticRetriever(BaseRetriever):
             )
             response.raise_for_status()
             return response.json()
+        except requests.Timeout:
+            logger.error(
+                "Timeout calling caipe-supervisor (%.1fs) — increase --supervisor-timeout",
+                self.timeout,
+            )
+            return None
+        except requests.HTTPError as exc:
+            logger.error(
+                "HTTP %s from caipe-supervisor: %s",
+                exc.response.status_code,
+                exc,
+            )
+            return None
         except Exception:
-            logger.exception("Error calling caipe-supervisor A2A endpoint")
+            logger.exception("Unexpected error calling caipe-supervisor A2A endpoint")
             return None
 
     def get_top_k(self, query: str, k: int = 3) -> List[tuple]:
@@ -227,15 +258,21 @@ class AgenticRAG(BaseRAG):
         Returns same dict shape as BaseRAG.query() for drop-in compatibility.
         """
         if run_id is None:
-            run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{hash(question) % 10000:04d}"
+            _q_hash = int(hashlib.md5(question.encode()).hexdigest(), 16) % 10000
+            run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_q_hash:04d}"
 
         self.traces = []
-        self.traces.append(TraceEvent(
-            event_type="query_start",
-            component="agentic_rag",
-            data={"run_id": run_id, "question": question,
-                  "supervisor_url": self._agentic_retriever.supervisor_url},
-        ))
+        self.traces.append(
+            TraceEvent(
+                event_type="query_start",
+                component="agentic_rag",
+                data={
+                    "run_id": run_id,
+                    "question": question,
+                    "supervisor_url": self._agentic_retriever.supervisor_url,
+                },
+            )
+        )
 
         try:
             top_docs = self._agentic_retriever.get_top_k(question, k=top_k)
@@ -249,7 +286,9 @@ class AgenticRAG(BaseRAG):
                     "document_id": (
                         self._agentic_retriever.documents_metadata[idx].get("doc_id")
                         if idx < len(self._agentic_retriever.documents_metadata)
-                        and self._agentic_retriever.documents_metadata[idx].get("doc_id")
+                        and self._agentic_retriever.documents_metadata[idx].get(
+                            "doc_id"
+                        )
                         else idx
                     ),
                     "metadata": (
@@ -281,17 +320,27 @@ class AgenticRAG(BaseRAG):
                     self._agentic_retriever.supervisor_url,
                 )
 
-            self.traces.append(TraceEvent(
-                event_type="query_complete",
-                component="agentic_rag",
-                data={"run_id": run_id, "success": True,
-                      "num_retrieved": len(retrieved_docs),
-                      "answer_length": len(answer)},
-            ))
+            self.traces.append(
+                TraceEvent(
+                    event_type="query_complete",
+                    component="agentic_rag",
+                    data={
+                        "run_id": run_id,
+                        "success": True,
+                        "num_retrieved": len(retrieved_docs),
+                        "answer_length": len(answer),
+                    },
+                )
+            )
 
-            logs_path = self.export_traces_to_log(run_id, question, {
-                "answer": answer, "retrieved_docs": retrieved_docs,
-            })
+            logs_path = self.export_traces_to_log(
+                run_id,
+                question,
+                {
+                    "answer": answer,
+                    "retrieved_docs": retrieved_docs,
+                },
+            )
 
             return {
                 "answer": answer,
@@ -303,13 +352,16 @@ class AgenticRAG(BaseRAG):
             }
 
         except Exception as e:
-            
-            traceback.print_exc()
-            self.traces.append(TraceEvent(
-                event_type="error",
-                component="agentic_rag",
-                data={"run_id": run_id, "error": str(e)},
-            ))
+            logger.exception(
+                "AgenticRAG [%s]: unhandled exception during query", run_id
+            )
+            self.traces.append(
+                TraceEvent(
+                    event_type="error",
+                    component="agentic_rag",
+                    data={"run_id": run_id, "error": str(e)},
+                )
+            )
             logs_path = self.export_traces_to_log(run_id, question, None)
             return {
                 "answer": f"Error processing query: {str(e)}",

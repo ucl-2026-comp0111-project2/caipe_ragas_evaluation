@@ -1,7 +1,5 @@
 import os
 import sys
-from ragas_eval.rag import default_rag_client  # noqa: E402
-from ragas_eval.agentic_rag import default_agentic_rag_client  # noqa: E402
 
 # Disable Ragas anonymous telemetry and background thread
 os.environ["RAGAS_DO_NOT_TRACK"] = "true"
@@ -37,7 +35,8 @@ from ragas_eval.metrics import ContainsAnswer  # noqa: E402
 
 # Add the current directory to the path so we can import rag module when run as a script
 sys.path.insert(0, str(Path(__file__).parent))
-from ragas_eval.rag import default_rag_client  # noqa: E402
+from ragas_eval.rag import default_rag_client                        # noqa: E402
+from ragas_eval.agentic_rag import default_agentic_rag_client        # noqa: E402
 
 # Global evaluation components (initialized via init_evaluator)
 openai_client: Any = None
@@ -552,6 +551,8 @@ def load_configuration(args) -> Dict[str, Any]:
         or settings.rag_eval_short_answer,
         "compute_model_eval": getattr(args, "compute_model_eval", False),
         "agentic": getattr(args, "agentic", False),
+        "supervisor_url": getattr(args, "supervisor_url", None) or settings.caipe_supervisor_url,
+        "supervisor_timeout": getattr(args, "supervisor_timeout", 120.0),
     }
     return config
 
@@ -599,12 +600,16 @@ def _init_patched_openai_client(config: Dict[str, Any]) -> tuple[OpenAI, Any]:
 
 
 def _init_rag_client(
-     config: Dict[str, Any], dataset: Optional[Dataset], openai_client: OpenAI
+    config: Dict[str, Any], dataset: Optional[Dataset], openai_client: OpenAI
 ) -> Any:
     """Initialize the RAG client based on compute_model_eval flag."""
     # Agentic mode: route through caipe-supervisor A2A endpoint
     if config.get("agentic"):
-        return default_agentic_rag_client(logdir="evals/logs")
+        return default_agentic_rag_client(
+            logdir="evals/logs",
+            supervisor_url=config.get("supervisor_url"),
+            timeout=config.get("supervisor_timeout", 120.0),
+        )
 
     if not config["compute_model_eval"]:
         return default_rag_client(
@@ -1067,6 +1072,17 @@ def _parse_args() -> argparse.Namespace:
         help="Use AgenticRAG — routes queries through caipe-supervisor's A2A endpoint "
              "instead of rag-server directly. Requires the rag_context patch applied to "
              "agent.py in your CAIPE instance.",
+    )
+    parser.add_argument(
+        "--supervisor-url",
+        default=None,
+        help="Override the caipe-supervisor A2A endpoint URL (default: CAIPE_SUPERVISOR_URL env or http://localhost:8000).",
+    )
+    parser.add_argument(
+        "--supervisor-timeout",
+        type=float,
+        default=120.0,
+        help="HTTP timeout in seconds for calls to caipe-supervisor (default: 120.0).",
     )
     return parser.parse_args()
 
