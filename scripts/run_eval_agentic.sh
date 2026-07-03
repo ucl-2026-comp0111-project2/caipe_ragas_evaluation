@@ -25,7 +25,15 @@ export CAIPE_OIDC_TOKEN=$(curl -s -X POST "http://localhost:7080/realms/caipe/pr
 # Ensure src/ is in the PYTHONPATH so python can find the package
 export PYTHONPATH=src:$PYTHONPATH
 
+# Run evaluation. Add flags as needed:
+#   --short-answer          Use SemanticSimilarity + ContainsAnswer (for HotpotQA-style short-answer datasets)
+#   --retrieval-only        Measure context_precision + context_recall only
+#   --generation-only       Measure answer quality only (skip context metrics)
+#   --compute-model-eval    Evaluate pre-existing model answers from the datasource
+#   --limit-per-category N  Limit questions per category
+#   --top-k N               Number of documents to retrieve
+
 # Activate virtual environment and run evaluation
 # shellcheck source=.venv/bin/activate
 source .venv/bin/activate
-python3 -m ragas_eval.evals --compute-model-eval --limit 10 --top-k 5
+python3 -m ragas_eval.evals --limit 1 --top-k 5 --agentic
