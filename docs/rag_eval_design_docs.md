@@ -14,9 +14,13 @@ The system consists of three main components:
 ```mermaid
 graph TD
     A[Data Ingestion] -->|Populates| B[CAIPE Knowledge Base]
-    C[Dataset / Questions] -->|Triggers Pipeline| D[RAG Pipeline]
-    B -->|Context Retrieval| D
-    D -->|Generates Answers & Latency| E[Ragas Evaluation Engine]
+    C[Dataset / Questions] -->|Triggers Pipeline| D1[BaseRAG Pipeline]
+    C -->|Triggers Pipeline| D2[AgenticRAG Pipeline]
+    B -->|Context Retrieval| D1
+    D2 -->|A2A message/send| S[caipe-supervisor]
+    S -->|rag_context + final_result artifacts| D2
+    D1 -->|Generates Answers & Latency| E[Ragas Evaluation Engine]
+    D2 -->|Generates Answers & Latency| E
     E -->|Grades Output| F[Reports & Failures Analysis]
     F -->|Outputs CSV/JSON| G[(Experiment Results)]
 ```
@@ -25,13 +29,16 @@ graph TD
 
 ## 2. Component Design & Code Structure
 
-* **Configuration Management ([config.py](../config.py))**: Consolidates settings such as LLM models, endpoints, datasource IDs, retrieval limits, and evaluation parameters using Pydantic Settings.
-* **Document Ingestion ([enterprise_rag_bench_ingest.py](../enterprise_rag_bench_ingest.py))**: Downloads dataset files, obtains OIDC tokens, and uploads batches to CAIPE.
-* **RAG Pipeline Implementation ([rag.py](../rag.py))**: Core RAG system implementing:
-  * [CaipeRetriever](../rag.py#L80): Queries CAIPE Knowledge Base using OIDC authentication.
-  * [SimpleKeywordRetriever](../rag.py#L50): Keyword matching fallback.
-  * [BaseRAG](../rag.py#L216): Coordinates document retrieval, prompt formulation, LLM completion, and telemetry tracing.
-* **Evaluation Orchestrator ([evals.py](../evals.py))**: Evaluates RAG performance, computes quality metrics, and handles LLM output formatting repairs via custom monkey-patches.
+* **Configuration Management ([config.py](../src/ragas_eval/config.py))**: Consolidates settings such as LLM models, endpoints, datasource IDs, retrieval limits, and evaluation parameters using Pydantic Settings.
+* **Document Ingestion ([enterprise_rag_bench_ingest.py](../src/ragas_eval/enterprise_rag_bench_ingest.py))**: Downloads dataset files, obtains OIDC tokens, and uploads batches to CAIPE.
+* **RAG Pipeline Implementation ([rag.py](../src/ragas_eval/rag.py))**: Core RAG system implementing:
+  * [CaipeRetriever](../src/ragas_eval/rag.py): Queries CAIPE Knowledge Base using OIDC authentication.
+  * [SimpleKeywordRetriever](../src/ragas_eval/rag.py): Keyword matching fallback.
+  * [BaseRAG](../src/ragas_eval/rag.py): Coordinates document retrieval, prompt formulation, LLM completion, and telemetry tracing.
+* **Agentic RAG Pipeline ([agentic_rag.py](../src/ragas_eval/agentic_rag.py))**: End-to-end agentic evaluation mode:
+  * [AgenticRetriever](../src/ragas_eval/agentic_rag.py): Queries `caipe-supervisor` via A2A JSON-RPC; parses `rag_context` artifacts for retrieved contexts.
+  * [AgenticRAG](../src/ragas_eval/agentic_rag.py): Collapses retrieval + generation into one A2A call. Requires `rag_context` patch on `agent.py`.
+* **Evaluation Orchestrator ([evals.py](../src/ragas_eval/evals.py))**: Evaluates RAG performance, computes quality metrics, and handles LLM output formatting repairs via custom monkey-patches.
 
 ---
 
@@ -62,13 +69,16 @@ sequenceDiagram
 ```
 
 ### Phase 2: RAG Pipeline execution
-1. `run_eval.sh` retrieves the Keycloak OIDC token from the Kubernetes secret store and exports it as `CAIPE_OIDC_TOKEN`.
-2. `evals.py` reads test samples from `enterprise_rag_bench_questions.jsonl`.
-3. For each query, `BaseRAG` triggers [retrieve_documents](../rag.py#L341) to fetch context from CAIPE. The retriever uses the token supplied by `settings.caipe_oidc_token` (derived from the `CAIPE_OIDC_TOKEN` environment variable).
-4. The retrieved contexts are formatted into the system prompt template.
-5. The RAG application requests a completion from the generation model (via LiteLLM / OpenAI proxy) to output the answer.
-6. The latency, raw tokens, retrieved document IDs, and logs are tracked.
 
+Two pipeline modes are supported, selected by the `--agentic` flag:
+
+**Standard mode** (`BaseRAG` — default, via `run_eval.sh`):
+1. `run_eval.sh` retrieves the Keycloak OIDC token and exports it as `CAIPE_OIDC_TOKEN`.
+2. `evals.py` reads test samples from the questions JSONL file.
+3. For each query, `BaseRAG` triggers `CaipeRetriever` to fetch context from CAIPE `/v1/query`.
+4. The retrieved contexts are formatted into the system prompt template.
+5. The RAG application requests a completion from the generation model (via LiteLLM).
+6. Latency, raw tokens, retrieved document IDs, and logs are tracked.
 
 ```mermaid
 sequenceDiagram
@@ -76,7 +86,7 @@ sequenceDiagram
     participant RAG as "rag.py (BaseRAG)"
     participant CAIPE as "CAIPE Query API (/v1/query)"
     participant LLM as LiteLLM Server
-    
+
     Eval->>RAG: query(question)
     RAG->>CAIPE: POST /v1/query (limit=k)
     CAIPE-->>RAG: Return retrieved documents & doc_ids
@@ -84,6 +94,31 @@ sequenceDiagram
     RAG->>LLM: chat.completions.create (user prompt)
     LLM-->>RAG: Return generated answer + usage stats
     RAG-->>Eval: Return answer, retrieved contexts, doc_ids, latency, tokens
+```
+
+**Agentic mode** (`AgenticRAG` — via `run_eval_agentic.sh --agentic`):
+1. `run_eval_agentic.sh` retrieves the OIDC token (used by `caipe-supervisor` internally).
+2. For each query, `AgenticRetriever` sends a single A2A `message/send` JSON-RPC call to `caipe-supervisor`.
+3. The agent performs its own multi-step retrieval and reasoning, calling `search` and `fetch_document` tools.
+4. The `rag_context` patch in `agent.py` emits one `rag_context` artifact per tool call.
+5. `AgenticRetriever.get_top_k()` parses all `rag_context` artifacts and the `final_result` artifact.
+6. Contexts and the generated answer are returned together to `AgenticRAG.query()`.
+
+```mermaid
+sequenceDiagram
+    participant Eval as evals.py
+    participant ARAG as AgenticRAG
+    participant AR as AgenticRetriever
+    participant Sup as caipe-supervisor (A2A)
+
+    Eval->>ARAG: query(question)
+    ARAG->>AR: get_top_k(question, k)
+    AR->>Sup: POST / (message/send JSON-RPC)
+    Sup-->>AR: artifacts[] with rag_context + final_result
+    AR->>AR: Parse rag_context artifacts → contexts + doc_ids
+    AR->>AR: Parse final_result → answer
+    AR-->>ARAG: Return [(idx, 1.0), ...]
+    ARAG-->>Eval: Return answer + retrieved_docs + doc_ids
 ```
 
 ### Phase 3: Ragas Evaluation, Output Repair & Diagnostics
@@ -132,12 +167,16 @@ flowchart TD
 The engine generates the following metrics:
 * **Latency (P50 & P95)**: Tracks generation and retrieval speed.
 * **Token Usage**: Measures prompt and completion tokens for both the RAG application and the Ragas evaluator.
-* **FactualCorrectness**: Verifies semantic alignment of generated answer with the ground-truth reference.
+* **FactualCorrectness / SemanticSimilarity**: Verifies semantic alignment of the generated answer with the ground-truth reference.
+* **ContainsAnswer**: Checks whether the reference answer string appears in the generated answer (used for short-answer datasets like HotpotQA).
 * **Faithfulness**: Measures whether the generated answer is grounded in the retrieved documents (checking for hallucinations).
 * **AnswerRelevancy**: Measures how relevant the generated answer is to the original question.
 * **ContextPrecision**: Checks if the most relevant retrieved documents are ranked at the top.
 * **ContextRecall**: Verifies whether all ground-truth reference statements can be answered using the retrieved documents.
 * **Retrieval Recall (Custom)**: Compares retrieved doc IDs against expected doc IDs for direct vector search quality.
+* **Retrieval Precision (Custom)**: Measures what fraction of retrieved doc IDs are actually relevant (in the expected set).
+
+> **Note on agentic metrics**: `context_recall`, `retrieval_recall`, and `retrieval_precision` require the `rag_context` patch on `agent.py`. Without it, only answer-quality metrics (`faithfulness`, `answer_relevancy`, `contains_answer`) can be scored.
 
 ---
 
@@ -145,5 +184,5 @@ The engine generates the following metrics:
 
 For more in-depth explanations on the system's core capabilities, see:
 * **[Metrics Integration & Custom Metrics Guide](metrics_integration_and_custom_metrics.md)**: Explains built-in Ragas metrics and how to implement custom evaluators.
-* **[Retrieval & Answering Integration Guide](retrieval_and_answering_integration.md)**: Explains retrieval architectures (`CaipeRetriever`) and generation flows (`BaseRAG`).
+* **[Retrieval & Answering Integration Guide](retrieval_and_answering_integration.md)**: Explains retrieval architectures (`CaipeRetriever`, `AgenticRetriever`) and generation flows (`BaseRAG`, `AgenticRAG`).
 
