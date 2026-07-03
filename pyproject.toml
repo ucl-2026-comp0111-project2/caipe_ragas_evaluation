@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ragas-eval"
 version = "0.1.0"
 description = "CAIPE Ragas Evaluation Suite for Enterprise RAG pipelines"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.14"
 dependencies = [
     "ragas[all]==0.3.5",
     "openai>=1.0.0",

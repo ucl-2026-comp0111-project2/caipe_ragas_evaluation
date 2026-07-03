@@ -146,6 +146,8 @@ Temporary Items
 cache/
 evals/
 data/
+*.jsonl
+*.csv
 
 # Tool caches
 .ruff_cache/
@@ -154,5 +156,6 @@ data/
 .vscode/
 *.code-workspace
 
-src/ragas_eval/evals.py.bak
-src/ragas_eval/rag.py.save
+# Editor artefacts
+*.bak
+*.save
