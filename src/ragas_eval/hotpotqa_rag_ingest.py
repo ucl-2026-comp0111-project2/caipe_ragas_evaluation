@@ -33,6 +33,9 @@ INGESTOR_TYPE = "hotpotqa"
 INGESTOR_NAME = "hotpotqa-eval-script"
 DEFAULT_QUESTIONS_FILE = "data/hotpotqa_full_questions.jsonl"
 
+TEN_YEARS_IN_SECONDS = 10 * 365 * 24 * 60 * 60  # 315360000
+YEAR_2033_EPOCH = 2000000000
+
 logger = logging.getLogger(__name__)
 
 
@@ -537,7 +540,7 @@ def upsert_datasource(session: requests.Session, rag_url: str, datasource_id: st
                 "description": "HotpotQA distractor-set context paragraphs (local dev RAG evaluation sample)",
                 "source_type": INGESTOR_TYPE,
                 "last_updated": int(time.time()),
-                "reload_interval": 315360000,
+                "reload_interval": TEN_YEARS_IN_SECONDS,
             },
         )
     )
@@ -580,7 +583,7 @@ def ingest_documents(
                     "ingestor_id": ingestor_id,
                     "datasource_id": datasource_id,
                     "job_id": job_id,
-                    "fresh_until": 2000000000,
+                    "fresh_until": YEAR_2033_EPOCH,
                 },
             )
         )
