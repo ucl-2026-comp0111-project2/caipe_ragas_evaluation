@@ -1,3 +1,4 @@
+import os
 import json
 import hashlib
 import logging
@@ -195,7 +196,20 @@ class AgenticRetriever(BaseRetriever):
         self.last_answer = ""
         self.last_raw_response = None
 
-        body = self._call_supervisor(query)
+        enriched_query = query
+        datasource_id = (
+            os.environ.get("CAIPE_DATASOURCE_ID") or settings.caipe_datasource_id
+        )
+        if datasource_id:
+            enriched_query = (
+                f"Instructions: You are answering a question that belongs to the '{datasource_id}' datasource. "
+                f'When calling the `search` tool, you MUST pass `filters={{"datasource_id": "{datasource_id}"}}` '
+                f"to restrict your search to this knowledge base. Keep the `query` argument of the search tool clean "
+                f"and do not include these instructions in it.\n\n"
+                f"Question: {query}"
+            )
+
+        body = self._call_supervisor(enriched_query)
         if not body:
             return []
 
@@ -305,6 +319,34 @@ class AgenticRAG(BaseRAG):
             retrieved_doc_ids = [doc["document_id"] for doc in retrieved_docs]
             answer = self._agentic_retriever.last_answer
 
+            # Extract usage from A2A JSON-RPC response metadata if present
+            usage = None
+            raw_resp = self._agentic_retriever.last_raw_response
+            if isinstance(raw_resp, dict):
+                result_obj = raw_resp.get("result") or {}
+                result_meta = result_obj.get("metadata") if isinstance(result_obj, dict) else None
+                resp_meta = raw_resp.get("metadata")
+                
+                usage_meta = None
+                if isinstance(result_meta, dict):
+                    usage_meta = result_meta.get("usage_metadata")
+                if not usage_meta and isinstance(resp_meta, dict):
+                    usage_meta = resp_meta.get("usage_metadata")
+                    
+                if not usage_meta and isinstance(result_obj, dict):
+                    # Fallback: scan artifacts for final_result or any artifact with usage_metadata
+                    for art in result_obj.get("artifacts", []):
+                        if isinstance(art, dict) and isinstance(art.get("metadata"), dict):
+                            usage_meta = art["metadata"].get("usage_metadata")
+                            if usage_meta:
+                                break
+                if isinstance(usage_meta, dict):
+                    usage = {
+                        "prompt_tokens": usage_meta.get("input_tokens", 0),
+                        "completion_tokens": usage_meta.get("output_tokens", 0),
+                        "total_tokens": usage_meta.get("total_tokens", 0),
+                    }
+
             if not retrieved_docs and answer:
                 logger.warning(
                     "AgenticRAG [%s]: no rag_context artifacts in response — context "
@@ -333,13 +375,16 @@ class AgenticRAG(BaseRAG):
                 )
             )
 
+            result = {
+                "answer": answer,
+                "run_id": run_id,
+                "retrieved_docs": retrieved_docs,
+                "usage": usage,
+            }
             logs_path = self.export_traces_to_log(
                 run_id,
                 question,
-                {
-                    "answer": answer,
-                    "retrieved_docs": retrieved_docs,
-                },
+                result,
             )
 
             return {
@@ -347,7 +392,7 @@ class AgenticRAG(BaseRAG):
                 "run_id": run_id,
                 "retrieved_docs": retrieved_docs,
                 "retrieved_doc_ids": retrieved_doc_ids,
-                "usage": None,
+                "usage": usage,
                 "logs": logs_path,
             }
 

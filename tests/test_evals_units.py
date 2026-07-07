@@ -11,6 +11,12 @@ from ragas_eval.metrics import ContainsAnswer, _normalize
 from ragas.dataset_schema import SingleTurnSample
 
 
+@pytest.fixture(autouse=True)
+def run_around_tests():
+    yield
+    evals.cleanup_evaluator()
+
+
 def test_sanitize_kwargs():
     # Positive
     kwargs = {"temperature": 0.5, "top_p": 0.9, "n": 2}
@@ -554,7 +560,7 @@ def test_log_metrics_summary():
             "failure_cause": ["none"],
         }
     )
-    evals._log_metrics_summary(config, df, [], 1.0, 1.0)
+    evals._log_metrics_summary(config, df, [], 1.0, 1.0, 10.0)
 
 
 def test_log_metrics_summary_negative():
@@ -568,7 +574,7 @@ def test_log_metrics_summary_negative():
         }
     )
     with pytest.raises(KeyError):
-        evals._log_metrics_summary(config, df, [], 1.0, 1.0)
+        evals._log_metrics_summary(config, df, [], 1.0, 1.0, 10.0)
 
 
 def test_save_evaluation_outputs_positive(tmp_path):
@@ -597,6 +603,8 @@ def test_save_evaluation_outputs_positive(tmp_path):
                 avg_recall=1.0,
                 avg_precision=1.0,
                 config_args={"limit": 10},
+                evaluation_time=10.0,
+                datasource="mock",
             )
         )
 
@@ -627,6 +635,8 @@ def test_save_evaluation_outputs_negative():
                 avg_recall=1.0,
                 avg_precision=1.0,
                 config_args={},
+                evaluation_time=10.0,
+                datasource="mock",
             )
         )
 
@@ -1070,7 +1080,7 @@ def test_config_resolution_and_priority():
         "failure_cause": ["none"],
     })
     with mock.patch("ragas_eval.evals.logger") as mock_logger:
-        _log_metrics_summary(config, df, [], 1.0, 1.0)
+        _log_metrics_summary(config, df, [], 1.0, 1.0, 10.0)
         # Verify that logger.info was called with config values
         mock_logger.info.assert_any_call("short_answer: True")
         mock_logger.info.assert_any_call("top_k: 5")

@@ -14,6 +14,7 @@ import argparse
 
 
 from openai import OpenAI
+import openai.resources.chat.completions
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -35,12 +36,13 @@ from ragas_eval.metrics import ContainsAnswer  # noqa: E402
 
 # Add the current directory to the path so we can import rag module when run as a script
 sys.path.insert(0, str(Path(__file__).parent))
-from ragas_eval.rag import default_rag_client                        # noqa: E402
-from ragas_eval.agentic_rag import default_agentic_rag_client        # noqa: E402
+from ragas_eval.rag import default_rag_client  # noqa: E402
+from ragas_eval.agentic_rag import default_agentic_rag_client  # noqa: E402
 
 # Global evaluation components (initialized via init_evaluator)
 openai_client: Any = None
 original_create: Any = None
+original_async_create: Any = None
 rag_client: Any = None
 ragas_llm: Any = None
 ragas_embeddings: Any = None
@@ -483,10 +485,37 @@ def patched_ragas_evaluator_llm_create(*args, **kwargs):
     expected_top_level, is_nli = _detect_expected_schema(kwargs.get("messages", []))
 
     try:
-        response = original_create(*args, **kwargs)
+        func = original_create
+        response = func(*args, **kwargs)
         _track_token_usage(response)
     except Exception:
         logger.exception("[RAGAS_EVALUATOR_LLM_PATCH] OpenAI completion request failed")
+        raise
+
+    if hasattr(response, "choices") and response.choices:
+        content = response.choices[0].message.content
+        if content and isinstance(content, str):
+            s_stripped = content.strip()
+            is_json = s_stripped.startswith(("{", "[", "`"))
+            if is_json:
+                response.choices[0].message.content = _normalize_json_response(
+                    content, expected_top_level, is_nli
+                )
+
+    return response
+
+
+async def patched_ragas_evaluator_llm_async_create(*args, **kwargs):
+    """Intercepts and patches Ragas async evaluator LLM calls to handle schema normalisation and token tracking."""
+    kwargs = _sanitize_kwargs(kwargs)
+    expected_top_level, is_nli = _detect_expected_schema(kwargs.get("messages", []))
+
+    try:
+        func = original_async_create
+        response = await func(*args, **kwargs)
+        _track_token_usage(response)
+    except Exception:
+        logger.exception("[RAGAS_EVALUATOR_LLM_PATCH] OpenAI async completion request failed")
         raise
 
     if hasattr(response, "choices") and response.choices:
@@ -551,7 +580,8 @@ def load_configuration(args) -> Dict[str, Any]:
         or settings.rag_eval_short_answer,
         "compute_model_eval": getattr(args, "compute_model_eval", False),
         "agentic": getattr(args, "agentic", False),
-        "supervisor_url": getattr(args, "supervisor_url", None) or settings.caipe_supervisor_url,
+        "supervisor_url": getattr(args, "supervisor_url", None)
+        or settings.caipe_supervisor_url,
         "supervisor_timeout": getattr(args, "supervisor_timeout", 120.0),
     }
     return config
@@ -594,9 +624,38 @@ def _init_patched_openai_client(config: Dict[str, Any]) -> tuple[OpenAI, Any]:
         timeout=None,
         default_headers={"drop_params": "true"},
     )
-    original = client.chat.completions.create
-    client.chat.completions.create = patched_ragas_evaluator_llm_create
-    return client, original
+    
+    global original_create, original_async_create
+    
+    # Patch globally on the class level so that both sync and async clients created
+    # by LangChain / Ragas internally are intercepted and tracked
+    if openai.resources.chat.completions.Completions.create != patched_ragas_evaluator_llm_create:
+        original_create = openai.resources.chat.completions.Completions.create
+        openai.resources.chat.completions.Completions.create = patched_ragas_evaluator_llm_create
+        
+    if openai.resources.chat.completions.AsyncCompletions.create != patched_ragas_evaluator_llm_async_create:
+        original_async_create = openai.resources.chat.completions.AsyncCompletions.create
+        openai.resources.chat.completions.AsyncCompletions.create = patched_ragas_evaluator_llm_async_create
+        
+    return client, original_create
+
+
+def cleanup_evaluator():
+    """Restores original patched client behaviors and resets globals."""
+    global openai_client, original_create, original_async_create, rag_client, ragas_llm, ragas_embeddings, metrics
+    
+    if original_create is not None:
+        openai.resources.chat.completions.Completions.create = original_create
+        original_create = None
+    if original_async_create is not None:
+        openai.resources.chat.completions.AsyncCompletions.create = original_async_create
+        original_async_create = None
+        
+    openai_client = None
+    rag_client = None
+    ragas_llm = None
+    ragas_embeddings = None
+    metrics = []
 
 
 def _init_rag_client(
@@ -1070,8 +1129,8 @@ def _parse_args() -> argparse.Namespace:
         "--agentic",
         action="store_true",
         help="Use AgenticRAG — routes queries through caipe-supervisor's A2A endpoint "
-             "instead of rag-server directly. Requires the rag_context patch applied to "
-             "agent.py in your CAIPE instance.",
+        "instead of rag-server directly. Requires the rag_context patch applied to "
+        "agent.py in your CAIPE instance.",
     )
     parser.add_argument(
         "--supervisor-url",
@@ -1090,7 +1149,10 @@ def _parse_args() -> argparse.Namespace:
 def _validate_questions_path(config: Dict[str, Any]) -> None:
     """Validate path if using enterprise_rag_bench, hotpotqa or model evaluation is enabled."""
     datasource_type = config["ragas_datasource"].lower()
-    if datasource_type in ("enterprise_rag_bench", "hotpotqa") or config["compute_model_eval"]:
+    if (
+        datasource_type in ("enterprise_rag_bench", "hotpotqa")
+        or config["compute_model_eval"]
+    ):
         questions_path = config["questions_path"]
         if not questions_path:
             raise ValueError(
@@ -1204,9 +1266,11 @@ def _analyze_failures(df: pd.DataFrame) -> Tuple[float, float]:
     df["retrieval_precision"] = precisions
     valid_recalls = [r for r in recalls if r is not None]
     valid_precisions = [p for p in precisions if p is not None]
-    
+
     avg_recall = sum(valid_recalls) / len(valid_recalls) if valid_recalls else 0.0
-    avg_precision = sum(valid_precisions) / len(valid_precisions) if valid_precisions else 0.0
+    avg_precision = (
+        sum(valid_precisions) / len(valid_precisions) if valid_precisions else 0.0
+    )
     return avg_recall, avg_precision
 
 
@@ -1216,9 +1280,11 @@ def _log_metrics_summary(
     metric_names: List[str],
     avg_recall: float,
     avg_precision: float,
+    evaluation_time: float,
 ) -> None:
     """Log configuration and summary metrics."""
     keys_to_print = [
+        "ragas_datasource",
         "rag_eval_top_k",
         "rag_eval_retrieval_only",
         "rag_eval_generation_only",
@@ -1230,16 +1296,18 @@ def _log_metrics_summary(
     logger.info("\n--- RUN CONFIGURATION ---")
     for k in keys_to_print:
         if k in config:
-            print_key = k.replace("rag_eval_", "")
+            print_key = k.replace("rag_eval_", "").replace("ragas_", "")
             logger.info(f"{print_key}: {config[k]}")
 
     logger.info("\n--- OPERATIONAL BEHAVIOR ---")
-    logger.info(f"P50 Latency: {df['latency'].median():.2f}s")
-    logger.info(f"P95 Latency: {df['latency'].quantile(0.95):.2f}s")
-    logger.info(f"Average Tokens: {df['total_tokens'].mean():.1f}")
-
+    logger.info("RAG Pipeline:")
+    logger.info(f"  P50 Latency: {df['latency'].median():.2f}s")
+    logger.info(f"  P95 Latency: {df['latency'].quantile(0.95):.2f}s")
+    logger.info(f"  Total Tokens: {int(df['total_tokens'].sum())}")
+    logger.info("")
+    logger.info("Ragas Evaluator:")
+    logger.info(f"  Evaluation Time: {evaluation_time:.2f}s")
     total_ragas_tokens = ragas_prompt_tokens + ragas_completion_tokens
-    logger.info("Ragas Evaluator LLM Token Usage:")
     logger.info(f"  Prompt Tokens: {ragas_prompt_tokens}")
     logger.info(f"  Completion Tokens: {ragas_completion_tokens}")
     logger.info(f"  Total Evaluator Tokens: {total_ragas_tokens}")
@@ -1267,6 +1335,8 @@ async def _save_evaluation_outputs(
     avg_recall: float,
     avg_precision: float,
     config_args: Dict[str, Any],
+    evaluation_time: float,
+    datasource: str,
 ) -> None:
     """Save the results DataFrame to CSV and companion JSON summary asynchronously."""
     output_dir = Path(".") / "evals" / "experiments"
@@ -1291,10 +1361,11 @@ async def _save_evaluation_outputs(
     summary_json_path = output_dir / f"{experiment_name}_summary.json"
     summary_data = {
         "experiment_name": experiment_name,
+        "datasource": datasource,
         "config_args": config_args,
         "p50_latency": df["latency"].median(),
         "p95_latency": df["latency"].quantile(0.95),
-        "average_tokens": df["total_tokens"].mean(),
+        "total_tokens": int(df["total_tokens"].sum()),
         "metrics": {
             **{m: df[m].mean() for m in metric_names},
             "retrieval_recall": avg_recall,
@@ -1303,6 +1374,7 @@ async def _save_evaluation_outputs(
         "average_retrieval_recall": avg_recall,
         "average_retrieval_precision": avg_precision,
         "ragas_evaluator_usage": {
+            "evaluation_time_seconds": evaluation_time,
             "prompt_tokens": ragas_prompt_tokens,
             "completion_tokens": ragas_completion_tokens,
             "total_tokens": ragas_prompt_tokens + ragas_completion_tokens,
@@ -1366,50 +1438,61 @@ async def main():
     # 4. Initialize evaluator using the pre-filtered dataset and consolidated configuration
     init_evaluator(config, dataset=dataset)
 
-    logger.info("\n--- PHASE 1: RUNNING RAG PIPELINE GENERATION ---")
-    experiment_results = await run_experiment.arun(dataset)
+    try:
+        logger.info("\n--- PHASE 1: RUNNING RAG PIPELINE GENERATION ---")
+        experiment_results = await run_experiment.arun(dataset)
 
-    # Convert generated results directly into a pandas frame
-    df = pd.DataFrame(experiment_results)
+        # Convert generated results directly into a pandas frame
+        df = pd.DataFrame(experiment_results)
 
-    logger.info("\n--- PHASE 2: BATCH EVALUATION VIA RAGAS ---")
-    eval_dataset = _prepare_eval_dataset(df)
+        logger.info("\n--- PHASE 2: BATCH EVALUATION VIA RAGAS ---")
+        eval_dataset = _prepare_eval_dataset(df)
 
-    legacy_embeddings: Any = LegacyEmbeddingsWrapper(ragas_embeddings)
+        legacy_embeddings: Any = LegacyEmbeddingsWrapper(ragas_embeddings)
 
-    # Run batch evaluation smoothly outside of active async worker threads
-    logger.info("Evaluating metrics across whole dataset...")
-    metric_names = _run_evaluation(
-        eval_dataset=eval_dataset,
-        df=df,
-        metrics_list=metrics,
-        legacy_embeddings=legacy_embeddings,
-        ragas_llm_obj=ragas_llm,
-    )
+        # Run batch evaluation smoothly outside of active async worker threads
+        logger.info("Evaluating metrics across whole dataset...")
+        start_eval_time = time.time()
+        metric_names = _run_evaluation(
+            eval_dataset=eval_dataset,
+            df=df,
+            metrics_list=metrics,
+            legacy_embeddings=legacy_embeddings,
+            ragas_llm_obj=ragas_llm,
+        )
+        evaluation_time = time.time() - start_eval_time
 
-    avg_recall, avg_precision = _analyze_failures(df)
+        avg_recall, avg_precision = _analyze_failures(df)
 
-    _log_metrics_summary(config, df, metric_names, avg_recall, avg_precision)
+        _log_metrics_summary(
+            config, df, metric_names, avg_recall, avg_precision, evaluation_time
+        )
 
-    config_args = {
-        k: v for k, v in vars(args).items() if v is not None and k != "openai_api_key"
-    }
+        config_args = {
+            k: v for k, v in vars(args).items() if v is not None and k != "openai_api_key"
+        }
 
-    await _save_evaluation_outputs(
-        experiment_name=experiment_results.name,
-        df=df,
-        metric_names=metric_names,
-        avg_recall=avg_recall,
-        avg_precision=avg_precision,
-        config_args=config_args,
-    )
+        await _save_evaluation_outputs(
+            experiment_name=experiment_results.name,
+            df=df,
+            metric_names=metric_names,
+            avg_recall=avg_recall,
+            avg_precision=avg_precision,
+            config_args=config_args,
+            evaluation_time=evaluation_time,
+            datasource=config["ragas_datasource"],
+        )
 
-    # Rename the dataset CSV to match the experiment name
-    old_dataset_path = Path("evals") / "datasets" / "test_dataset.csv"
-    if old_dataset_path.exists():
-        new_dataset_path = Path("evals") / "datasets" / f"{experiment_results.name}.csv"
-        await asyncio.to_thread(old_dataset_path.rename, new_dataset_path)
-        logger.info(f"Dataset renamed to match experiment: {new_dataset_path.resolve()}")
+        # Rename the dataset CSV to match the experiment name
+        old_dataset_path = Path("evals") / "datasets" / "test_dataset.csv"
+        if old_dataset_path.exists():
+            new_dataset_path = Path("evals") / "datasets" / f"{experiment_results.name}.csv"
+            await asyncio.to_thread(old_dataset_path.rename, new_dataset_path)
+            logger.info(
+                f"Dataset renamed to match experiment: {new_dataset_path.resolve()}"
+            )
+    finally:
+        cleanup_evaluator()
 
 
 if __name__ == "__main__":

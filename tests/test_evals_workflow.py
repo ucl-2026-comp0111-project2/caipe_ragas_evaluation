@@ -9,6 +9,12 @@ from ragas_eval import evals
 from ragas_eval.config import settings
 
 
+@pytest.fixture(autouse=True)
+def run_around_tests():
+    yield
+    evals.cleanup_evaluator()
+
+
 def test_init_evaluator_positive():
     """Test that init_evaluator correctly applies CLI arguments to configure Settings overrides."""
     args = mock.Mock()
@@ -55,6 +61,7 @@ def test_init_evaluator_precomputed():
     args.limit_per_category = None
     args.compute_model_eval = True
     args.questions_path = None
+    args.agentic = False
 
     with mock.patch("ragas_eval.evals.OpenAI"), mock.patch(
         "ragas_eval.evals.llm_factory"
@@ -85,6 +92,7 @@ def test_init_evaluator_with_real_ragas_dataset():
     args.limit_per_category = None
     args.compute_model_eval = True
     args.questions_path = None
+    args.agentic = False
 
     # Instantiate a real ragas.Dataset and add a mock sample
     real_dataset = Dataset(name="test_dataset", backend="local/csv", root_dir="evals")
