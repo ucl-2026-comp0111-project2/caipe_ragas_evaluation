@@ -102,7 +102,7 @@ sequenceDiagram
 3. The agent performs its own multi-step retrieval and reasoning, calling `search` and `fetch_document` tools.
 4. The `rag_context` patch in `agent.py` emits one `rag_context` artifact per tool call.
 5. `AgenticRetriever.get_top_k()` parses all `rag_context` artifacts and the `final_result` artifact.
-6. Contexts and the generated answer are returned together to `AgenticRAG.query()`.
+6. Contexts, the generated answer, and agentic model token usage (`usage_metadata` from the supervisor response metadata) are returned together to `AgenticRAG.query()`.
 
 ```mermaid
 sequenceDiagram
@@ -114,11 +114,12 @@ sequenceDiagram
     Eval->>ARAG: query(question)
     ARAG->>AR: get_top_k(question, k)
     AR->>Sup: POST / (message/send JSON-RPC)
-    Sup-->>AR: artifacts[] with rag_context + final_result
+    Sup-->>AR: artifacts[] with rag_context + final_result (and metadata.usage_metadata)
     AR->>AR: Parse rag_context artifacts → contexts + doc_ids
     AR->>AR: Parse final_result → answer
     AR-->>ARAG: Return [(idx, 1.0), ...]
-    ARAG-->>Eval: Return answer + retrieved_docs + doc_ids
+    ARAG->>ARAG: Extract usage_metadata (tokens) from response
+    ARAG-->>Eval: Return answer + retrieved_docs + doc_ids + usage
 ```
 
 ### Phase 3: Ragas Evaluation, Output Repair & Diagnostics
@@ -166,7 +167,7 @@ flowchart TD
 
 The engine generates the following metrics:
 * **Latency (P50 & P95)**: Tracks generation and retrieval speed.
-* **Token Usage**: Measures prompt and completion tokens for both the RAG application and the Ragas evaluator.
+* **Token Usage**: Measures prompt and completion tokens for both the RAG application/agent under test (collected via local OpenAI hook in standard mode or extracted from remote supervisor A2A `usage_metadata` in agentic mode) and the Ragas evaluator.
 * **FactualCorrectness / SemanticSimilarity**: Verifies semantic alignment of the generated answer with the ground-truth reference.
 * **ContainsAnswer**: Checks whether the reference answer string appears in the generated answer (used for short-answer datasets like HotpotQA).
 * **Faithfulness**: Measures whether the generated answer is grounded in the retrieved documents (checking for hallucinations).

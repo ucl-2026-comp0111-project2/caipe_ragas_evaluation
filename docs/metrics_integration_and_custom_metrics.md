@@ -310,6 +310,7 @@ When running evaluations, the console output and saved summary JSONs (e.g. `{exp
 
 ```text
 --- RUN CONFIGURATION ---
+datasource: mock
 top_k: 5
 retrieval_only: False
 generation_only: False
@@ -317,12 +318,14 @@ limit_per_category: 10
 compute_model_eval: False
 short_answer: True
 
-
 --- OPERATIONAL BEHAVIOR ---
-P50 Latency: 2.30s
-P95 Latency: 3.78s
-Average Tokens: 902.5
-Ragas Evaluator LLM Token Usage:
+RAG Pipeline:
+  P50 Latency: 2.30s
+  P95 Latency: 3.78s
+  Total Tokens: 11732
+
+Ragas Evaluator:
+  Evaluation Time: 45.20s
   Prompt Tokens: 15854
   Completion Tokens: 2196
   Total Evaluator Tokens: 18050
@@ -347,9 +350,12 @@ Name: count, dtype: int64
 ### Explaining the Metrics
 
 1. **Operational Metrics**:
-   * **Latency (P50/P95)**: Tracks user response speeds (50% and 95% of queries finished within 2.30s and 3.78s respectively).
-   * **Average Tokens**: Average tokens used by the RAG generation pipeline.
-   * **Ragas Evaluator Tokens**: Tracks the prompt and completion tokens consumed by the LLM running the Ragas evaluations (very helpful for cost monitoring).
+   * **RAG Pipeline**:
+     * **Latency (P50/P95)**: Tracks response generation speeds of the RAG agent/pipeline under test (50% and 95% of queries finished within 2.30s and 3.78s respectively).
+     * **Total Tokens**: Total tokens consumed by the RAG generation pipeline across all queries in the evaluation run.
+   * **Ragas Evaluator**:
+     * **Evaluation Time**: The wall-clock execution time for Ragas to evaluate the entire dataset.
+     * **Evaluator Tokens (Prompt/Completion/Total)**: Tracks the prompt and completion tokens consumed by the LLM running the Ragas evaluations (extremely helpful for cost monitoring).
 
 2. **Quality Metrics**:
    * **semantic_similarity (0.58)**: Compares the generated answer semantic similarity to the reference ground truth (scale: `0.0` to `1.0`).
