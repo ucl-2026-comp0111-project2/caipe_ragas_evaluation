@@ -173,6 +173,7 @@ def test_upsert_datasource_positive():
     assert args_json["datasource_id"] == "test_ds"
     assert args_json["name"] == "test_ds_name"
     assert args_json["ingestor_id"] == "ingestor_123"
+    assert args_json["reload_interval"] == 315360000
 
 
 def test_upsert_datasource_negative():
@@ -334,6 +335,8 @@ def test_ingest_documents_positive():
     
     # 1 batch per doc (2 iterations total) -> each iteration makes 3 POST requests: /ingest, /increment-document-count, /increment-progress
     assert mock_session.post.call_count == 6
+    payload = mock_session.post.call_args_list[0][1]["json"]
+    assert payload["fresh_until"] == 2000000000
 
 
 def test_ingest_documents_negative():

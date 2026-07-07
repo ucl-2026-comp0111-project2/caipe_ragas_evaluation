@@ -433,6 +433,7 @@ def test_upsert_datasource_success():
     mock_session.post.assert_called_once()
     payload = mock_session.post.call_args[1]["json"]
     assert payload["datasource_id"] == "ds_1"
+    assert payload["reload_interval"] == 315360000
 
 
 def test_upsert_datasource_failure():
@@ -477,6 +478,8 @@ def test_ingest_documents_success():
     ingest.ingest_documents(mock_session, "http://url", "ing_1", "ds_1", "job_1", docs, batch_size=1)
     # /ingest, /increment-document-count, /increment-progress
     assert mock_session.post.call_count == 3
+    payload = mock_session.post.call_args_list[0][1]["json"]
+    assert payload["fresh_until"] == 2000000000
 
 
 def test_ingest_documents_failure():

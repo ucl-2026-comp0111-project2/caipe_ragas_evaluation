@@ -453,6 +453,7 @@ def upsert_datasource(
                 ),
                 "source_type": INGESTOR_TYPE,
                 "last_updated": int(time.time()),
+                "reload_interval": 315360000,
             },
         )
     )
@@ -497,6 +498,7 @@ def ingest_documents(
                     "ingestor_id": ingestor_id,
                     "datasource_id": datasource_id,
                     "job_id": job_id,
+                    "fresh_until": 2000000000,
                 },
             )
         )
