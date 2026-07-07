@@ -38,8 +38,12 @@ export PYTHONPATH=src:$PYTHONPATH
 #   --compute-model-eval    Evaluate pre-existing model answers from the datasource
 #   --limit-per-category N  Limit questions per category
 #   --top-k N               Number of documents to retrieve
+#   --agentic               Use AgenticRAG — routes queries through caipe-supervisor's A2A endpoint
+#                             instead of rag-server directly. Requires the rag_context patch applied to
+#                             agent.py in your CAIPE instance.
+#   --supervisor-url        The base URL of the caipe-supervisor (default: https://caipe.internal.dev)
+#   --supervisor-timeout    Timeout in seconds for supervisor calls (default: 120)
 
 # Activate virtual environment and run evaluation
 # shellcheck source=.venv/bin/activate
-source .venv/bin/activate
-python3 -m ragas_eval.evals --limit-per-category 10 --top-k 5
+uv run python3 -m ragas_eval.evals --limit-per-category 1 --top-k 5 --agentic
