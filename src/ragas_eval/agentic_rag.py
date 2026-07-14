@@ -175,7 +175,7 @@ class AgenticRetriever(BaseRetriever):
         super().__init__()
         self.agent_api_url = (
             agent_api_url
-            or getattr(settings, "caipe_supervisor_url", None)
+            or getattr(settings, "caipe_agent_api_url", None)
             or "http://localhost:8000"
         )
         self.timeout = timeout
