@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from ragas_eval.rag import CaipeRetriever
+from ragas_eval.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class PrecomputedRAG:
         """Initializes the PrecomputedRAG instance with the path to the precomputed dataset or preloaded samples."""
         self.dataset_path = dataset_path
         self.data_by_question: Dict[str, Dict[str, Any]] = {}
-        self.retriever = CaipeRetriever()
+        self.retriever = CaipeRetriever(insecure=settings.insecure_ssl)
         if preloaded_samples is not None:
             self.load_from_samples(preloaded_samples)
         else:

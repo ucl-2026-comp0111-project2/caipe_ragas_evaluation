@@ -22,12 +22,13 @@ class Settings(BaseSettings):
     caipe_query_endpoint: str = Field(default="http://localhost:9446/v1/query", validation_alias="caipe_query_endpoint")
     caipe_supervisor_url: str = Field(default="http://localhost:8000", validation_alias="caipe_supervisor_url")
     caipe_oidc_token: Optional[str] = Field(default=None, validation_alias="caipe_oidc_token")
+    insecure_ssl: bool = Field(default=False, validation_alias="insecure_ssl")
     ragas_datasource: str = Field(default="enterprise_rag_bench")
     questions_path: str = Field(default="", validation_alias="questions_path")
     ragas_limit: Optional[int] = Field(default=None, validation_alias="ragas_limit")
 
     # RAG Pipeline Configs
-    rag_eval_top_k: int = Field(default=3)
+    rag_eval_top_k: int = Field(default=10)
     rag_eval_retrieval_only: bool = Field(default=False)
     rag_eval_generation_only: bool = Field(default=False)
     rag_eval_short_answer: bool = Field(default=False)

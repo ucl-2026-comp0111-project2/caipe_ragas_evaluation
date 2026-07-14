@@ -12,7 +12,7 @@ def test_config_defaults():
     assert settings.openai_endpoint == "http://localhost:4000/v1"
     assert settings.openai_model_name == "qwen3.5-35b"
     assert settings.embeddings_model == "bge-m3"
-    assert settings.rag_eval_top_k == 3
+    assert settings.rag_eval_top_k == 10
     assert settings.rag_eval_retrieval_only is False
     assert settings.rag_eval_generation_only is False
 

@@ -89,12 +89,14 @@ class CaipeRetriever(BaseRetriever):
         endpoint_url: Optional[str] = None,
         datasource_id: Optional[str] = None,
         token: Optional[str] = None,
+        insecure: bool = False,
     ):
         """Initializes CaipeRetriever with endpoint URL, datasource ID, and OIDC token settings."""
         super().__init__()
         self.endpoint_url = endpoint_url or settings.caipe_query_endpoint
         self.datasource_id = datasource_id or settings.caipe_datasource_id
         self._token = token or settings.caipe_oidc_token
+        self.insecure = insecure or settings.insecure_ssl
         self.documents_metadata = []
 
     @property
@@ -170,7 +172,7 @@ class CaipeRetriever(BaseRetriever):
         }
 
         try:
-            response = requests.post(self.endpoint_url, headers=headers, json=payload)
+            response = requests.post(self.endpoint_url, headers=headers, json=payload, verify=not self.insecure)
             response.raise_for_status()
             results = response.json()
 
@@ -639,6 +641,7 @@ def default_rag_client(
     logdir: str = "logs",
     use_caipe: bool = True,
     model_name: Optional[str] = None,
+    insecure: bool = False,
 ) -> BaseRAG:
     """
     Create a default RAG client with OpenAI LLM and optional retriever.
@@ -648,11 +651,12 @@ def default_rag_client(
         logdir: Directory for trace logs
         use_caipe: Whether to use CaipeRetriever (defaults to True)
         model_name: Optional name of the model to use
+        insecure: Skip SSL verification (for self-signed certs)
     Returns:
         BaseRAG instance
     """
     if use_caipe:
-        retriever = CaipeRetriever()
+        retriever = CaipeRetriever(insecure=insecure or settings.insecure_ssl)
     else:
         retriever = SimpleKeywordRetriever()
 
