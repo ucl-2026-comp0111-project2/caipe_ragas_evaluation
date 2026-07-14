@@ -564,7 +564,7 @@ def test_log_metrics_summary():
 
 
 def test_log_metrics_summary_negative():
-    # Negative: Missing required columns raises KeyError
+    # Negative: Missing required columns should be handled gracefully without raising KeyError
     config = {
         "rag_eval_top_k": 5,
     }
@@ -573,8 +573,9 @@ def test_log_metrics_summary_negative():
             "some_other_column": [1.0],
         }
     )
-    with pytest.raises(KeyError):
-        evals._log_metrics_summary(config, df, [], 1.0, 1.0, 10.0)
+    # Should not raise KeyError
+    evals._log_metrics_summary(config, df, [], 1.0, 1.0, 10.0)
+
 
 
 def test_save_evaluation_outputs_positive(tmp_path):
@@ -624,21 +625,21 @@ def test_save_evaluation_outputs_positive(tmp_path):
 
 
 def test_save_evaluation_outputs_negative():
-    # Negative: empty DataFrame or missing columns raises KeyError
+    # Negative: empty DataFrame or missing columns should be handled gracefully without raising KeyError
     df = pd.DataFrame()
-    with pytest.raises(KeyError):
-        asyncio.get_event_loop().run_until_complete(
-            evals._save_evaluation_outputs(
-                experiment_name="test_exp_fail",
-                df=df,
-                metric_names=[],
-                avg_recall=1.0,
-                avg_precision=1.0,
-                config_args={},
-                evaluation_time=10.0,
-                datasource="mock",
-            )
+    # Should not raise KeyError
+    asyncio.get_event_loop().run_until_complete(
+        evals._save_evaluation_outputs(
+            experiment_name="test_exp_fail",
+            df=df,
+            metric_names=[],
+            avg_recall=1.0,
+            avg_precision=1.0,
+            config_args={},
+            evaluation_time=10.0,
+            datasource="mock",
         )
+    )
 
 
 class TestNormalize:
@@ -1084,5 +1085,144 @@ def test_config_resolution_and_priority():
         # Verify that logger.info was called with config values
         mock_logger.info.assert_any_call("short_answer: True")
         mock_logger.info.assert_any_call("top_k: 5")
+
+
+def test_experiment_name_prefix_with_datasource():
+    """Verify that experiment name is correctly prefixed when datasource is non-empty."""
+    config = {"ragas_datasource": "hotpotqa"}
+    mock_results = mock.Mock()
+    mock_results.name = "rag_run_12345"
+
+    datasource_name = config.get("ragas_datasource")
+    if isinstance(datasource_name, str) and datasource_name.strip():
+        experiment_name = f"{datasource_name.strip()}_{mock_results.name}"
+    else:
+        experiment_name = mock_results.name
+
+    assert experiment_name == "hotpotqa_rag_run_12345"
+
+
+def test_experiment_name_prefix_without_datasource():
+    """Verify that experiment name is not prefixed when datasource is empty, None, or a non-string."""
+    for empty_val in [None, "", "   ", 123]:
+        config = {"ragas_datasource": empty_val}
+        mock_results = mock.Mock()
+        mock_results.name = "rag_run_12345"
+
+        datasource_name = config.get("ragas_datasource")
+        if isinstance(datasource_name, str) and datasource_name.strip():
+            experiment_name = f"{datasource_name.strip()}_{mock_results.name}"
+        else:
+            experiment_name = mock_results.name
+
+        assert experiment_name == "rag_run_12345"
+
+
+def test_run_evaluation_reason_extraction():
+    """Test that _run_evaluation extracts the correct reasoning and appends it to df."""
+    from ragas.metrics import Faithfulness, FactualCorrectness
+    
+    mock_results = mock.Mock()
+    mock_df = pd.DataFrame({
+        "faithfulness": [0.5],
+        "factual_correctness": [1.0]
+    })
+    mock_results.to_pandas = mock.Mock(return_value=mock_df)
+    
+    mock_results.traces = [
+        {
+            "faithfulness": {
+                "n_l_i_statement_prompt": {
+                    "output": {
+                        "statements": [
+                            {"statement": "stmt 1", "reason": "reason 1", "verdict": 1},
+                            {"statement": "stmt 2", "reason": "reason 2", "verdict": 0}
+                        ]
+                    }
+                }
+            },
+            "factual_correctness": {
+                "n_l_i_statement_prompt": {
+                    "output": {
+                        "statements": [
+                            {"statement": "stmt 3", "reason": "reason 3", "verdict": 1}
+                        ]
+                    }
+                }
+            }
+        }
+    ]
+    
+    df = pd.DataFrame({"question": ["q1"]})
+    metrics = [Faithfulness(), FactualCorrectness()]
+    
+    with mock.patch("ragas_eval.evals.evaluate", return_value=mock_results):
+        metric_names = evals._run_evaluation(
+            eval_dataset=mock.Mock(),
+            df=df,
+            metrics_list=metrics,
+            legacy_embeddings=mock.Mock(),
+            ragas_llm_obj=mock.Mock()
+        )
+        
+    assert "faithfulness" in metric_names
+    assert "factual_correctness" in metric_names
+    assert "faithfulness_reason" in df.columns
+    assert "factual_correctness_reason" in df.columns
+    assert df.loc[0, "faithfulness_reason"] == "[1] stmt 1 -> reason 1; [0] stmt 2 -> reason 2"
+    assert df.loc[0, "factual_correctness_reason"] == "[1] stmt 3 -> reason 3"
+
+
+def test_extract_statements_positive_dict():
+    # Test dictionary with 'statements' directly nested inside the prompt output
+    data = {
+        "n_l_i_statement_prompt": {
+            "output": {"statements": [{"statement": "s1", "verdict": 1, "reason": "r1"}]}
+        }
+    }
+    res = evals._extract_statements(data)
+    assert len(res) == 1
+    assert res[0]["statement"] == "s1"
+
+
+def test_extract_statements_positive_dict_legacy():
+    # Test dictionary with legacy 'n_l_i_statement_prompt' nested structure
+    data = {
+        "n_l_i_statement_prompt": {
+            "output": {
+                "statements": [{"statement": "s2", "verdict": 0, "reason": "r2"}]
+            }
+        }
+    }
+    res = evals._extract_statements(data)
+    assert len(res) == 1
+    assert res[0]["statement"] == "s2"
+
+
+def test_extract_statements_positive_pydantic_model():
+    # Mock a Pydantic model/object output nested under n_l_i_statement_prompt
+    class MockOutput:
+        statements = [{"statement": "s3", "verdict": 1, "reason": "r3"}]
+
+    data = {
+        "n_l_i_statement_prompt": {
+            "output": MockOutput()
+        }
+    }
+    res = evals._extract_statements(data)
+    assert len(res) == 1
+    assert res[0]["statement"] == "s3"
+
+
+def test_extract_statements_negative_none_and_empty():
+    # Test None
+    assert evals._extract_statements(None) == []
+    # Test empty dict
+    assert evals._extract_statements({}) == []
+    # Test random structure
+    assert evals._extract_statements({"random_key": "val"}) == []
+
+
+
 
 

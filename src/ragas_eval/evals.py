@@ -20,6 +20,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 from ragas import Dataset, experiment, evaluate, EvaluationDataset  # noqa: E402
+from ragas.utils import memorable_names  # noqa: E402
 from ragas.llms import llm_factory  # noqa: E402
 from ragas.embeddings import BaseRagasEmbedding  # noqa: E402
 from ragas.embeddings.base import embedding_factory  # noqa: E402
@@ -580,9 +581,10 @@ def load_configuration(args) -> Dict[str, Any]:
         or settings.rag_eval_short_answer,
         "compute_model_eval": getattr(args, "compute_model_eval", False),
         "agentic": getattr(args, "agentic", False),
-        "supervisor_url": getattr(args, "supervisor_url", None)
-        or settings.caipe_supervisor_url,
-        "supervisor_timeout": getattr(args, "supervisor_timeout", 120.0),
+        "agent_api_url": getattr(args, "agent_api_url", None)
+        or settings.caipe_agent_api_url,
+        "agent_api_timeout": getattr(args, "agent_api_timeout", 120.0),
+        "trace_log": getattr(args, "enable_trace_log", False),
     }
     return config
 
@@ -666,8 +668,10 @@ def _init_rag_client(
     if config.get("agentic"):
         return default_agentic_rag_client(
             logdir="evals/logs",
-            supervisor_url=config.get("supervisor_url"),
-            timeout=config.get("supervisor_timeout", 120.0),
+            agent_api_url=config.get("agent_api_url"),
+            timeout=config.get("agent_api_timeout", 120.0),
+            insecure=settings.insecure_ssl,
+            trace_log=config.get("trace_log", False),
         )
 
     if not config["compute_model_eval"]:
@@ -675,6 +679,7 @@ def _init_rag_client(
             llm_client=openai_client,
             logdir="evals/logs",
             model_name=config["openai_model_name"],
+            insecure=settings.insecure_ssl,
         )
 
     from ragas_eval.precomputed_rag import PrecomputedRAG
@@ -1021,13 +1026,13 @@ async def run_experiment(row):
     )
 
     if retrieval_only:
-        retrieved_docs = rag_client.retrieve_documents(row["question"], top_k=top_k_val)
+        retrieved_docs = rag_client.retrieve_documents(row["question"], top_k=top_k_val) or []
         latency = time.time() - start_time
         retrieved_contexts = [doc["content"] for doc in retrieved_docs]
         retrieved_doc_ids = [
-            doc.get("metadata", {}).get("doc_id")
+            (doc.get("metadata") or {}).get("doc_id")
             for doc in retrieved_docs
-            if doc.get("metadata", {}).get("doc_id")
+            if (doc.get("metadata") or {}).get("doc_id")
         ]
         return {
             **row,
@@ -1043,12 +1048,12 @@ async def run_experiment(row):
     latency = time.time() - start_time
 
     answer = response_data.get("answer", "")
-    retrieved_docs = response_data.get("retrieved_docs", [])
+    retrieved_docs = response_data.get("retrieved_docs") or []
     retrieved_contexts = [doc["content"] for doc in retrieved_docs]
     retrieved_doc_ids = [
-        doc.get("metadata", {}).get("doc_id")
+        (doc.get("metadata") or {}).get("doc_id")
         for doc in retrieved_docs
-        if doc.get("metadata", {}).get("doc_id")
+        if (doc.get("metadata") or {}).get("doc_id")
     ]
     usage = response_data.get("usage") or {}
     total_tokens = usage.get("total_tokens", 0)
@@ -1121,6 +1126,11 @@ def _parse_args() -> argparse.Namespace:
         help="Use PrecomputedRAG to evaluate pre-existing model answers and contexts in the datasource",
     )
     parser.add_argument(
+        "--enable-trace-log",
+        action="store_true",
+        help="Capture the raw agentic SSE stream logs in a separate file (agentic_run_{run_id}.log)",
+    )
+    parser.add_argument(
         "--short-answer",
         action="store_true",
         help="Use SemanticSimilarity + ContainsAnswer (for HotpotQA-style short-answer datasets)",
@@ -1133,15 +1143,15 @@ def _parse_args() -> argparse.Namespace:
         "agent.py in your CAIPE instance.",
     )
     parser.add_argument(
-        "--supervisor-url",
+        "--agent-api-url",
         default=None,
-        help="Override the caipe-supervisor A2A endpoint URL (default: CAIPE_SUPERVISOR_URL env or http://localhost:8000).",
+        help="Override the agent API endpoint URL (default: CAIPE_AGENT_API_URL env or http://localhost:8000).",
     )
     parser.add_argument(
-        "--supervisor-timeout",
+        "--agent-api-timeout",
         type=float,
         default=120.0,
-        help="HTTP timeout in seconds for calls to caipe-supervisor (default: 120.0).",
+        help="HTTP timeout in seconds for calls to the agent API (default: 120.0).",
     )
     return parser.parse_args()
 
@@ -1184,6 +1194,30 @@ def _prepare_eval_dataset(df: pd.DataFrame) -> EvaluationDataset:
     return EvaluationDataset(samples=samples)
 
 
+def _extract_statements(val: Any) -> List[Any]:
+    """Safely extracts statements list from n_l_i_statement_prompt output (dict or Pydantic)."""
+    if not isinstance(val, dict):
+        return []
+
+    prompt_data = val.get("n_l_i_statement_prompt")
+    if not isinstance(prompt_data, dict):
+        return []
+
+    output_obj = prompt_data.get("output")
+    if not output_obj:
+        return []
+
+    # If output_obj is a Pydantic model / custom object
+    if hasattr(output_obj, "statements"):
+        return getattr(output_obj, "statements") or []
+
+    # If output_obj is a dict
+    if isinstance(output_obj, dict):
+        return output_obj.get("statements") or []
+
+    return []
+
+
 def _run_evaluation(
     eval_dataset: EvaluationDataset,
     df: pd.DataFrame,
@@ -1203,6 +1237,8 @@ def _run_evaluation(
     metric_names = [m.name for m in metrics_list]
     for col in metric_names:
         df[col] = 0.0
+    df["faithfulness_reason"] = ""
+    df["factual_correctness_reason"] = ""
 
     try:
         results = evaluate(
@@ -1224,6 +1260,56 @@ def _run_evaluation(
             ]
             if matching_cols:
                 df[col] = scores_df[matching_cols[0]].values
+
+        # Extract reasons from traces if available
+        reasons_dict: Dict[str, List[str]] = {
+            "faithfulness": [],
+            "factual_correctness": []
+        }
+        traces = getattr(results, "traces", [])
+        for trace in traces:
+            # 1. Faithfulness reasoning
+            faith_reason = ""
+            if "faithfulness" in trace:
+                statements = _extract_statements(trace["faithfulness"])
+                if statements:
+                    faith_reasons_list = []
+                    for stmt in statements:
+                        if isinstance(stmt, dict):
+                            verdict = stmt.get("verdict")
+                            statement = stmt.get("statement")
+                            reason = stmt.get("reason")
+                        else:
+                            verdict = getattr(stmt, "verdict", None)
+                            statement = getattr(stmt, "statement", None)
+                            reason = getattr(stmt, "reason", None)
+                        faith_reasons_list.append(f"[{verdict}] {statement} -> {reason}")
+                    faith_reason = "; ".join(faith_reasons_list)
+            reasons_dict["faithfulness"].append(faith_reason)
+
+            # 2. Factual correctness reasoning
+            fc_reason = ""
+            if "factual_correctness" in trace:
+                statements = _extract_statements(trace["factual_correctness"])
+                if statements:
+                    fc_reasons_list = []
+                    for stmt in statements:
+                        if isinstance(stmt, dict):
+                            verdict = stmt.get("verdict")
+                            statement = stmt.get("statement")
+                            reason = stmt.get("reason")
+                        else:
+                            verdict = getattr(stmt, "verdict", None)
+                            statement = getattr(stmt, "statement", None)
+                            reason = getattr(stmt, "reason", None)
+                        fc_reasons_list.append(f"[{verdict}] {statement} -> {reason}")
+                    fc_reason = "; ".join(fc_reasons_list)
+            reasons_dict["factual_correctness"].append(fc_reason)
+
+        if "faithfulness" in metric_names and len(reasons_dict["faithfulness"]) == len(df):
+            df["faithfulness_reason"] = reasons_dict["faithfulness"]
+        if "factual_correctness" in metric_names and len(reasons_dict["factual_correctness"]) == len(df):
+            df["factual_correctness_reason"] = reasons_dict["factual_correctness"]
     except Exception as e:
         logger.exception(f"Error during Ragas evaluate execution: {e}")
         # Fallback to 0.0 for all metrics on failure
@@ -1301,9 +1387,18 @@ def _log_metrics_summary(
 
     logger.info("\n--- OPERATIONAL BEHAVIOR ---")
     logger.info("RAG Pipeline:")
-    logger.info(f"  P50 Latency: {df['latency'].median():.2f}s")
-    logger.info(f"  P95 Latency: {df['latency'].quantile(0.95):.2f}s")
-    logger.info(f"  Total Tokens: {int(df['total_tokens'].sum())}")
+    if not df.empty and "latency" in df.columns:
+        logger.info(f"  P50 Latency: {df['latency'].median():.2f}s")
+        logger.info(f"  P95 Latency: {df['latency'].quantile(0.95):.2f}s")
+    else:
+        logger.info("  P50 Latency: 0.00s")
+        logger.info("  P95 Latency: 0.00s")
+        
+    if not df.empty and "total_tokens" in df.columns:
+        logger.info(f"  Total Tokens: {int(df['total_tokens'].sum())}")
+    else:
+        logger.info("  Total Tokens: 0")
+        
     logger.info("")
     logger.info("Ragas Evaluator:")
     logger.info(f"  Evaluation Time: {evaluation_time:.2f}s")
@@ -1314,18 +1409,22 @@ def _log_metrics_summary(
 
     logger.info("\n--- QUALITY METRICS AVERAGE ---")
     for m in metric_names:
-        logger.info(f"Average {m}: {df[m].mean():.2f}")
+        avg_val = df[m].mean() if (not df.empty and m in df.columns) else 0.0
+        logger.info(f"Average {m}: {avg_val:.2f}")
 
-    valid_recalls = [r for r in df["retrieval_recall"] if r is not None]
+    valid_recalls = [r for r in df["retrieval_recall"] if r is not None] if (not df.empty and "retrieval_recall" in df.columns) else []
     if valid_recalls:
         logger.info(f"Average retrieval_recall: {avg_recall:.2f}")
 
-    valid_precisions = [p for p in df["retrieval_precision"] if p is not None]
+    valid_precisions = [p for p in df["retrieval_precision"] if p is not None] if (not df.empty and "retrieval_precision" in df.columns) else []
     if valid_precisions:
         logger.info(f"Average retrieval_precision: {avg_precision:.2f}")
 
     logger.info("\n--- FAILURE CAUSE ANALYSIS ---")
-    logger.info(f"\n{df['failure_cause'].value_counts()}")
+    if not df.empty and "failure_cause" in df.columns:
+        logger.info(f"\n{df['failure_cause'].value_counts()}")
+    else:
+        logger.info("\nNo failure cause data available.")
 
 
 async def _save_evaluation_outputs(
@@ -1336,7 +1435,7 @@ async def _save_evaluation_outputs(
     avg_precision: float,
     config_args: Dict[str, Any],
     evaluation_time: float,
-    datasource: str,
+    datasource: Optional[str],
 ) -> None:
     """Save the results DataFrame to CSV and companion JSON summary asynchronously."""
     output_dir = Path(".") / "evals" / "experiments"
@@ -1346,10 +1445,10 @@ async def _save_evaluation_outputs(
     # Create a summary row with overall averages
     summary_row: dict[str, Any] = dict.fromkeys(df.columns, "")
     summary_row["question"] = "AVERAGE_METRICS"
-    summary_row["latency"] = df["latency"].mean()
-    summary_row["total_tokens"] = df["total_tokens"].mean()
+    summary_row["latency"] = df["latency"].mean() if (not df.empty and "latency" in df.columns) else 0.0
+    summary_row["total_tokens"] = df["total_tokens"].mean() if (not df.empty and "total_tokens" in df.columns) else 0.0
     for m in metric_names:
-        summary_row[m] = df[m].mean()
+        summary_row[m] = df[m].mean() if (not df.empty and m in df.columns) else 0.0
     summary_row["retrieval_recall"] = avg_recall
     summary_row["retrieval_precision"] = avg_precision
     summary_row["failure_cause"] = "N/A"
@@ -1363,11 +1462,11 @@ async def _save_evaluation_outputs(
         "experiment_name": experiment_name,
         "datasource": datasource,
         "config_args": config_args,
-        "p50_latency": df["latency"].median(),
-        "p95_latency": df["latency"].quantile(0.95),
-        "total_tokens": int(df["total_tokens"].sum()),
+        "p50_latency": df["latency"].median() if (not df.empty and "latency" in df.columns) else 0.0,
+        "p95_latency": df["latency"].quantile(0.95) if (not df.empty and "latency" in df.columns) else 0.0,
+        "total_tokens": int(df["total_tokens"].sum()) if (not df.empty and "total_tokens" in df.columns) else 0,
         "metrics": {
-            **{m: df[m].mean() for m in metric_names},
+            **{m: (df[m].mean() if (not df.empty and m in df.columns) else 0.0) for m in metric_names},
             "retrieval_recall": avg_recall,
             "retrieval_precision": avg_precision,
         },
@@ -1438,9 +1537,16 @@ async def main():
     # 4. Initialize evaluator using the pre-filtered dataset and consolidated configuration
     init_evaluator(config, dataset=dataset)
 
+    datasource_name = config.get("ragas_datasource")
+    memorable_name = memorable_names.generate_unique_name()
+    if isinstance(datasource_name, str) and datasource_name.strip():
+        experiment_name = f"{datasource_name.strip()}_{memorable_name}"
+    else:
+        experiment_name = memorable_name
+
     try:
         logger.info("\n--- PHASE 1: RUNNING RAG PIPELINE GENERATION ---")
-        experiment_results = await run_experiment.arun(dataset)
+        experiment_results = await run_experiment.arun(dataset, name=experiment_name)
 
         # Convert generated results directly into a pandas frame
         df = pd.DataFrame(experiment_results)
@@ -1473,20 +1579,20 @@ async def main():
         }
 
         await _save_evaluation_outputs(
-            experiment_name=experiment_results.name,
+            experiment_name=experiment_name,
             df=df,
             metric_names=metric_names,
             avg_recall=avg_recall,
             avg_precision=avg_precision,
             config_args=config_args,
             evaluation_time=evaluation_time,
-            datasource=config["ragas_datasource"],
+            datasource=datasource_name,
         )
 
         # Rename the dataset CSV to match the experiment name
         old_dataset_path = Path("evals") / "datasets" / "test_dataset.csv"
         if old_dataset_path.exists():
-            new_dataset_path = Path("evals") / "datasets" / f"{experiment_results.name}.csv"
+            new_dataset_path = Path("evals") / "datasets" / f"{experiment_name}.csv"
             await asyncio.to_thread(old_dataset_path.rename, new_dataset_path)
             logger.info(
                 f"Dataset renamed to match experiment: {new_dataset_path.resolve()}"
