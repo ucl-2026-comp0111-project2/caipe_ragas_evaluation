@@ -18,12 +18,12 @@ export RAG_EVAL_SHORT_ANSWER="true"
 
 # Fetch OIDC credentials from Kubernetes
 # Assumption: CAIPE is deployed using KinD (Kubernetes in Docker) with OIDC enabled.
-# The credentials (Client ID and Secret) are fetched directly from the Kubernetes cluster secret 'rag-ingestor-secret' in the 'caipe' namespace.
-CLIENT_ID=$(kubectl get secret rag-ingestor-secret -n caipe -o jsonpath='{.data.INGESTOR_OIDC_CLIENT_ID}' | base64 --decode)
-CLIENT_SECRET=$(kubectl get secret rag-ingestor-secret -n caipe -o jsonpath='{.data.INGESTOR_OIDC_CLIENT_SECRET}' | base64 --decode)
+# The credentials (Client ID and Secret) are fetched directly from the Kubernetes cluster secret 'caipe-ui-secret' in the 'caipe' namespace.
+CLIENT_ID=$(kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_ID}' | base64 --decode)
+CLIENT_SECRET=$(kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_SECRET}' | base64 --decode)
 
 # Fetch OIDC token from Keycloak
-export CAIPE_OIDC_TOKEN=$(curl -s -X POST "http://localhost:7080/realms/caipe/protocol/openid-connect/token" \
+export CAIPE_OIDC_TOKEN=$(curl -sk -X POST "https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token" \
   -d "client_id=${CLIENT_ID}" \
   -d "client_secret=${CLIENT_SECRET}" \
   -d "grant_type=client_credentials" | jq -r '.access_token')
@@ -41,8 +41,8 @@ export PYTHONPATH=src:$PYTHONPATH
 #   --agentic               Use AgenticRAG — routes queries through caipe-supervisor's A2A endpoint
 #                             instead of rag-server directly. Requires the rag_context patch applied to
 #                             agent.py in your CAIPE instance.
-#   --supervisor-url        The base URL of the caipe-supervisor (default: https://caipe.internal.dev)
-#   --supervisor-timeout    Timeout in seconds for supervisor calls (default: 120)
+#   --agent-api-url        The base URL of the agent API (default: CAIPE_AGENT_API_URL env or http://localhost:8000)
+#   --agent-api-timeout    Timeout in seconds for agent API calls (default: 120)
 
 # Activate virtual environment and run evaluation
 # shellcheck source=.venv/bin/activate

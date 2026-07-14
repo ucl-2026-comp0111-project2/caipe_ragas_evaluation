@@ -8,6 +8,8 @@ RAG_URL = os.getenv("RAG_URL", "http://localhost:9446")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 
+INSECURE_SSL = os.getenv("INSECURE_SSL", "false").lower() in ("true", "1", "yes")
+
 def get_oidc_token():
     """Fetch OIDC token dynamically if client credentials are available, or reuse environment token."""
     token = os.getenv("CAIPE_OIDC_TOKEN")
@@ -36,6 +38,7 @@ def get_oidc_token():
                 "client_secret": client_secret,
                 "grant_type": "client_credentials",
             },
+            verify=not INSECURE_SSL,
             timeout=10
         )
         resp.raise_for_status()
@@ -98,7 +101,12 @@ def restore():
     # 3. Fetch registered datasources from RAG server
     print("Fetching active datasources from RAG server...")
     try:
-        resp = requests.get(f"{RAG_URL}/v1/datasources", headers=headers, timeout=10)
+        resp = requests.get(
+            f"{RAG_URL}/v1/datasources",
+            headers=headers,
+            verify=not INSECURE_SSL,
+            timeout=10,
+        )
         resp.raise_for_status()
         registered_ds = {ds["datasource_id"] for ds in resp.json().get("datasources", [])}
         print(f"Registered datasources in Redis: {registered_ds}")
@@ -131,7 +139,13 @@ def restore():
 
         print(f"Registering datasource '{ds_id}'...")
         try:
-            register_resp = requests.post(f"{RAG_URL}/v1/datasource", json=payload, headers=headers, timeout=10)
+            register_resp = requests.post(
+                f"{RAG_URL}/v1/datasource",
+                json=payload,
+                headers=headers,
+                verify=not INSECURE_SSL,
+                timeout=10,
+            )
             register_resp.raise_for_status()
             print(f"Successfully restored: {ds_id}")
         except Exception as e:

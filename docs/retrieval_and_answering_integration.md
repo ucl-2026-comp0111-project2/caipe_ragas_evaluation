@@ -26,7 +26,7 @@ classDiagram
         +get_top_k(query, k)
     }
     class AgenticRetriever {
-        +str supervisor_url
+        +str agent_api_url
         +float timeout
         +str last_answer
         +list documents_metadata
@@ -132,7 +132,15 @@ The A2A response contains one `rag_context` artifact per tool call. Two shapes a
 ]
 ```
 
-Both shapes produce `(content, doc_id)` tuples. Results are deduplicated by content (preserving order) and capped to `k` items.
+Both shapes produce `(content, doc_id)` tuples. The integration handles these contexts with the following semantics:
+
+1. **CAIPE Search Limit**: The search tool (`knowledge-base_search`) applies its configured `limit` (e.g. `limit=k`) in full to **each** of the parallel search methods (semantic and keyword).
+2. **De-duplication & Overlap**: Depending on the query, semantic and keyword search results may overlap:
+   * **Complete Overlap**: If both lists contain identical documents, de-duplication reduces the search outputs to up to `k` unique documents.
+   * **Zero Overlap**: If there is no overlap, the search output contains up to `2 * k` unique documents.
+3. **Consolidation & Merging**: The client merges search snippets and fetched documents by `doc_id`. If a document is fetched via `knowledge-base_fetch_document`, its full page content replaces the truncated search snippet of the same document ID. This ensures Ragas evaluates against the actual full content the agent read.
+4. **Snippet Fallback (Noise Representation)**: If a document is returned in the search results but the agent does **not** fetch it, its truncated search snippet is still preserved in the final context. This reflects the exact visual context/noise that was present in the agent's chat history.
+5. **Prompt-Level Guardrails (No Slicing)**: To prevent discarding full documents that the agent actually read and used, no code-level slicing `[:k]` is applied. The configured `k` value is instead injected into the agent's prompt to act as the autonomous guardrail for search tool limits and selective document fetches.
 
 ### Prerequisite: `rag_context` patch
 
@@ -146,7 +154,7 @@ The patch makes the agent yield a `rag_context` artifact whenever the `search` o
 from ragas_eval.agentic_rag import default_agentic_rag_client
 
 client = default_agentic_rag_client(
-    supervisor_url="http://localhost:8000",  # default
+    agent_api_url="http://localhost:8000",  # default
     timeout=120.0,
     logdir="evals/logs",
 )

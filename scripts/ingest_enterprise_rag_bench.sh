@@ -17,7 +17,7 @@ CLIENT_ID=$(kubectl get secret rag-ingestor-secret -n caipe -o jsonpath='{.data.
 CLIENT_SECRET=$(kubectl get secret rag-ingestor-secret -n caipe -o jsonpath='{.data.INGESTOR_OIDC_CLIENT_SECRET}' | base64 --decode)
 
 # Fetch OIDC token from Keycloak
-export CAIPE_OIDC_TOKEN=$(curl -s -X POST "http://localhost:7080/realms/caipe/protocol/openid-connect/token" \
+export CAIPE_OIDC_TOKEN=$(curl -sk -X POST "https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token" \
   -d "client_id=${CLIENT_ID}" \
   -d "client_secret=${CLIENT_SECRET}" \
   -d "grant_type=client_credentials" | jq -r '.access_token')
@@ -26,4 +26,4 @@ export CAIPE_OIDC_TOKEN=$(curl -s -X POST "http://localhost:7080/realms/caipe/pr
 export PYTHONPATH=src:$PYTHONPATH
 
 # Run the ingestion script passing through any CLI arguments
-uv run python3 -m ragas_eval.enterprise_rag_bench_ingest --limit-per-source 1000 "$@"
+uv run python3 -m ragas_eval.enterprise_rag_bench_ingest --rag-url https://rag.caipe.homelab --oidc-token-url "https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token" --oidc-client-id "${CLIENT_ID}" --oidc-client-secret "${CLIENT_SECRET}" --prioritize-reference --limit-per-source 1000 --insecure "$@"

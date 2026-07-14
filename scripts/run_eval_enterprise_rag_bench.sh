@@ -41,8 +41,8 @@ export PYTHONPATH=src:$PYTHONPATH
 #   --agentic               Use AgenticRAG — routes queries through caipe-supervisor's A2A endpoint
 #                             instead of rag-server directly. Requires the rag_context patch applied to
 #                             agent.py in your CAIPE instance.
-#   --supervisor-url        The base URL of the caipe-supervisor (default: https://caipe.internal.dev)
-#   --supervisor-timeout    Timeout in seconds for supervisor calls (default: 120)
+#   --agent-api-url        The base URL of the agent API (default: CAIPE_AGENT_API_URL env or http://localhost:8000)
+#   --agent-api-timeout    Timeout in seconds for agent API calls (default: 120)
 
 # Activate virtual environment and run evaluation
 # shellcheck source=.venv/bin/activate
