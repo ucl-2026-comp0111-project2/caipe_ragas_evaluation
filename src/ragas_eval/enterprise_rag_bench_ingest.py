@@ -58,7 +58,10 @@ ALL_SOURCE_TYPES = list(SOURCE_SLICE_COUNTS.keys())
 
 
 def _get_oidc_token(
-    oidc_token_url: str, client_id: str | None = None, client_secret: str | None = None
+    oidc_token_url: str,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    insecure: bool = False,
 ) -> str:
     """Fetch OIDC token for CAIPE ingestion service using client credentials"""
     if not client_id or not client_secret:
@@ -74,6 +77,7 @@ def _get_oidc_token(
                 "client_secret": client_secret,
                 "grant_type": "client_credentials",
             },
+            verify=not insecure,
         )
         response.raise_for_status()
         return response.json()["access_token"]
@@ -606,9 +610,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sources",
         nargs="+",
-        default=["confluence", "jira"],
+        default=None,
         choices=ALL_SOURCE_TYPES,
-        help="Source types to ingest (default: confluence jira — highest reference-doc frequency)",
+        help="Source types to ingest (default: all sources if not specified)",
     )
     parser.add_argument(
         "--limit-per-source",
@@ -625,7 +629,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--query-limit", type=int, default=3)
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--skip-ingest", action="store_true")
-    parser.add_argument("--all-sources", action="store_true")
     parser.add_argument(
         "--start-batch",
         type=int,
@@ -669,12 +672,20 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Prioritize reference documents covered by questions first",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        default=False,
+        help="Disable SSL certificate verification (for self-signed certs)",
+    )
     return parser.parse_args()
 
 
 def _setup_session(args: argparse.Namespace) -> requests.Session:
     """Set up requests.Session with optional OIDC auto-refresh authentication."""
     session = requests.Session()
+    if getattr(args, "insecure", False):
+        session.verify = False
     if not args.use_oidc:
         return session
 
@@ -706,12 +717,13 @@ def _setup_session(args: argparse.Namespace) -> requests.Session:
                     oidc_token_url,
                     oidc_client_id,
                     oidc_client_secret,
+                    insecure=getattr(args, "insecure", False),
                 )
                 session.headers.update({"Authorization": f"Bearer {new_token}"})
                 if "headers" in req_kwargs and "Authorization" in req_kwargs["headers"]:
                     req_kwargs["headers"]["Authorization"] = f"Bearer {new_token}"
                 req_kwargs["_is_retry"] = True
-                resp = orig_request(*req_args, **req_kwargs)
+                resp = session.request(*req_args, **req_kwargs)
             except Exception:
                 logger.exception("Failed to refresh OIDC token")
         return resp
@@ -862,7 +874,7 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
     args = _parse_args()
-    sources = ALL_SOURCE_TYPES if args.all_sources else args.sources
+    sources = args.sources if args.sources is not None else ALL_SOURCE_TYPES
 
     session = _setup_session(args)
 

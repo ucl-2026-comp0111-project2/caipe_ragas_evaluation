@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_oidc_token(
-    oidc_token_url: str, client_id: str | None = None, client_secret: str | None = None
+    oidc_token_url: str, client_id: str | None = None, client_secret: str | None = None, insecure: bool = False
 ) -> str:
     """Fetch OIDC token for CAIPE ingestion service using client credentials"""
     if not client_id or not client_secret:
@@ -57,6 +57,7 @@ def _get_oidc_token(
                 "grant_type": "client_credentials",
             },
             timeout=30,
+            verify=not insecure,
         )
         response.raise_for_status()
         return response.json()["access_token"]
@@ -77,6 +78,8 @@ def _check(resp: requests.Response) -> requests.Response:
 def _setup_session(args: argparse.Namespace) -> requests.Session:
     """Set up requests.Session with optional OIDC auto-refresh authentication."""
     session = requests.Session()
+    if getattr(args, "insecure", False):
+        session.verify = False
     if not args.use_oidc:
         # No Authorization header is sent on this session - on a local dev stack with
         # CAIPE_UNSAFE_RBAC_BYPASS=true this is what makes rag-server treat the
@@ -111,6 +114,7 @@ def _setup_session(args: argparse.Namespace) -> requests.Session:
                     oidc_token_url,
                     oidc_client_id,
                     oidc_client_secret,
+                    insecure=getattr(args, "insecure", False),
                 )
                 session.headers.update({"Authorization": f"Bearer {new_token}"})
                 if "headers" in req_kwargs and "Authorization" in req_kwargs["headers"]:
@@ -966,6 +970,12 @@ def main() -> None:
         nargs="?",
         const=DEFAULT_QUESTIONS_FILE,
         help=f"Prioritize reference documents covered by the specified questions file (defaults to {DEFAULT_QUESTIONS_FILE})",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        default=False,
+        help="Disable SSL certificate verification (for self-signed certs)",
     )
 
     args = parser.parse_args()
