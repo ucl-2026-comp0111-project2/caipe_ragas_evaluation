@@ -88,7 +88,7 @@ def _parse_rag_context_artifact(text: Any) -> list:
                     # Convert to string before appending so doc IDs are consistently typed.
                     resolved_id = str(doc_id) if doc_id is not None else None
                     out.append((clean_snippet_markdown(txt), resolved_id))
-                    logger.info(
+                    logger.debug(
                         "Snippet: %s | DocID: %s",
                         clean_snippet_markdown(txt),
                         resolved_id,
@@ -260,7 +260,7 @@ class AgenticRetriever(BaseRetriever):
                     client_secret = base64.b64decode(client_secret_b64).decode()
                     os.environ["CAIPE_CLIENT_ID"] = client_id
                     os.environ["CAIPE_CLIENT_SECRET"] = client_secret
-                    logger.info("Successfully fetched OIDC credentials from Kubernetes.")
+                    logger.debug("Successfully fetched OIDC credentials from Kubernetes.")
             except Exception as e:
                 logger.debug("Could not fetch credentials from Kubernetes: %s", e)
 
@@ -275,7 +275,7 @@ class AgenticRetriever(BaseRetriever):
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 try:
-                    logger.info("Fetching a fresh OIDC token from Keycloak (attempt %d/%d): %s", attempt, max_attempts, keycloak_url)
+                    logger.debug("Fetching a fresh OIDC token from Keycloak (attempt %d/%d): %s", attempt, max_attempts, keycloak_url)
                     resp = httpx.post(
                         keycloak_url,
                         data={
@@ -331,7 +331,7 @@ class AgenticRetriever(BaseRetriever):
             log_filepath = os.path.join(self.logdir, f"agentic_run_{run_id}.log")
             try:
                 log_file = open(log_filepath, "w")
-                logger.info("Capturing agentic stream log to %s", log_filepath)
+                logger.debug("Capturing agentic stream log to %s", log_filepath)
                 log_file.write(f"--- RAG QUERY START (run_id: {run_id}) ---\n")
                 log_file.write(f"Question: {question}\n")
                 log_file.write(f"Agent URL: {self.agent_api_url}\n\n")
@@ -360,7 +360,7 @@ class AgenticRetriever(BaseRetriever):
 
             for attempt in range(1, max_attempts + 1):
                 try:
-                    logger.info("Creating conversation session on %s (attempt %d/%d)...", conv_url, attempt, max_attempts)
+                    logger.debug("Creating conversation session on %s (attempt %d/%d)...", conv_url, attempt, max_attempts)
                     if log_file:
                         log_file.write(f"Creating conversation session on {conv_url} (attempt {attempt}/{max_attempts})...\n")
                         log_file.flush()
@@ -381,7 +381,7 @@ class AgenticRetriever(BaseRetriever):
                         token = self._get_oidc_token()
                         if token:
                             headers["Authorization"] = f"Bearer {token}"
-                            logger.info("Retrying conversation session creation with fresh token...")
+                            logger.debug("Retrying conversation session creation with fresh token...")
                             if log_file:
                                 log_file.write("Retrying conversation session creation with fresh token...\n")
                                 log_file.flush()
@@ -395,7 +395,7 @@ class AgenticRetriever(BaseRetriever):
                     r_conv.raise_for_status()
                     conv_data = r_conv.json()
                     conversation_id = conv_data["data"]["conversation"]["_id"]
-                    logger.info("Conversation session created with ID: %s", conversation_id)
+                    logger.debug("Conversation session created with ID: %s", conversation_id)
                     if log_file:
                         log_file.write(f"Conversation session created with ID: {conversation_id}\n\n")
                         log_file.flush()
@@ -431,7 +431,7 @@ class AgenticRetriever(BaseRetriever):
 
             for attempt in range(1, max_attempts + 1):
                 try:
-                    logger.info("Streaming query from %s (attempt %d/%d)...", stream_url, attempt, max_attempts)
+                    logger.debug("Streaming query from %s (attempt %d/%d)...", stream_url, attempt, max_attempts)
                     if log_file:
                         log_file.write(f"Streaming query from {stream_url} (attempt {attempt}/{max_attempts})...\n")
                         log_file.flush()

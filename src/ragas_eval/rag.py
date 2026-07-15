@@ -632,7 +632,7 @@ class BaseRAG:
         with open(log_filepath, "w") as f:
             json.dump(log_data, f, indent=2)
 
-        logger.info(f"RAG traces exported to: {log_filepath}")
+        logger.debug(f"RAG traces exported to: {log_filepath}")
         return log_filepath
 
 

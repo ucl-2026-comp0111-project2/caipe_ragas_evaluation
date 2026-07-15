@@ -53,6 +53,9 @@ metrics = []
 ragas_prompt_tokens = 0
 ragas_completion_tokens = 0
 
+# Global list to collect Ragas evaluator LLM call traces
+ragas_llm_traces = []
+
 GENERATED_STATEMENT_REASON = "Generated statement"
 
 # Import consolidated configuration settings
@@ -444,10 +447,10 @@ def _log_original_json(
     except Exception:
         pretty_original = content
 
-    logger.info(
+    logger.debug(
         f"\n[RAGAS_EVALUATOR_LLM_PATCH] Expected Schema: {expected_top_level!r} (is_nli={is_nli})"
     )
-    logger.info(
+    logger.debug(
         f"[RAGAS_EVALUATOR_LLM_PATCH] Original content (JSON):\n{pretty_original}"
     )
 
@@ -485,55 +488,166 @@ def _normalize_json_response(
     return repaired_content
 
 
-def patched_ragas_evaluator_llm_create(*args, **kwargs):
-    """Intercepts and patches Ragas evaluator LLM calls to handle schema normalisation and token tracking."""
-    kwargs = _sanitize_kwargs(kwargs)
-    expected_top_level, is_nli = _detect_expected_schema(kwargs.get("messages", []))
+def _sanitize_for_json(val: Any) -> Any:
+    """Recursively converts Mock/MagicMock and other non-serializable objects to standard types for JSON export."""
+    if type(val).__name__ in ("Mock", "MagicMock"):
+        return f"<Mock: {type(val).__name__}>"
+    if isinstance(val, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_sanitize_for_json(item) for item in val]
+    if isinstance(val, (str, int, float, bool, type(None))):
+        return val
+    try:
+        # Check if json serializable
+        json.dumps(val)
+        return val
+    except TypeError:
+        return str(val)
 
+
+def _add_llm_trace(
+    messages: List[Dict[str, Any]],
+    expected_top_level: Optional[str],
+    is_nli: bool,
+    original_content: Optional[str] = None,
+    repaired_content: Optional[str] = None,
+    response: Any = None,
+    error: Optional[Exception] = None,
+    json_parse_success: Optional[bool] = None,
+) -> None:
+    """Appends an LLM interaction trace to the global trace list."""
+    global ragas_llm_traces
+    trace: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "messages": messages,
+        "expected_top_level": expected_top_level,
+        "is_nli": is_nli,
+        "original_content": original_content,
+        "repaired_content": repaired_content,
+        "json_parse_success": json_parse_success,
+    }
+    if error is not None:
+        trace["error"] = str(error)
+    if response is not None:
+        usage = getattr(response, "usage", None)
+        if usage:
+            if isinstance(usage, dict):
+                trace["usage"] = usage
+            elif hasattr(usage, "model_dump"):
+                try:
+                    trace["usage"] = usage.model_dump()
+                except Exception:
+                    trace["usage"] = {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                    }
+            elif hasattr(usage, "dict"):
+                try:
+                    trace["usage"] = usage.dict()
+                except Exception:
+                    trace["usage"] = {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                    }
+            else:
+                trace["usage"] = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                }
+    ragas_llm_traces.append(_sanitize_for_json(trace))
+
+
+def patched_ragas_evaluator_llm_create(*args, **kwargs):
+    """Intercepts and patches Ragas evaluator LLM calls to handle schema normalisation, token tracking, and trace logging."""
+    kwargs = _sanitize_kwargs(kwargs)
+    messages = kwargs.get("messages", [])
+    expected_top_level, is_nli = _detect_expected_schema(messages)
+
+    response = None
     try:
         func = original_create
         response = func(*args, **kwargs)
         _track_token_usage(response)
-    except Exception:
+    except Exception as e:
         logger.exception("[RAGAS_EVALUATOR_LLM_PATCH] OpenAI completion request failed")
+        _add_llm_trace(messages, expected_top_level, is_nli, error=e)
         raise
 
+    original_content = None
+    repaired_content = None
+    json_parse_success = None
     if hasattr(response, "choices") and response.choices:
         content = response.choices[0].message.content
         if content and isinstance(content, str):
+            original_content = content
             s_stripped = content.strip()
             is_json = s_stripped.startswith(("{", "[", "`"))
             if is_json:
-                response.choices[0].message.content = _normalize_json_response(
+                parsed, _ = _parse_json_content(content)
+                json_parse_success = (parsed is not None)
+                repaired_content = _normalize_json_response(
                     content, expected_top_level, is_nli
                 )
+                response.choices[0].message.content = repaired_content
 
+    _add_llm_trace(
+        messages,
+        expected_top_level,
+        is_nli,
+        original_content=original_content,
+        repaired_content=repaired_content,
+        response=response,
+        json_parse_success=json_parse_success,
+    )
     return response
 
 
 async def patched_ragas_evaluator_llm_async_create(*args, **kwargs):
-    """Intercepts and patches Ragas async evaluator LLM calls to handle schema normalisation and token tracking."""
+    """Intercepts and patches Ragas async evaluator LLM calls to handle schema normalisation, token tracking, and trace logging."""
     kwargs = _sanitize_kwargs(kwargs)
-    expected_top_level, is_nli = _detect_expected_schema(kwargs.get("messages", []))
+    messages = kwargs.get("messages", [])
+    expected_top_level, is_nli = _detect_expected_schema(messages)
 
+    response = None
     try:
         func = original_async_create
         response = await func(*args, **kwargs)
         _track_token_usage(response)
-    except Exception:
+    except Exception as e:
         logger.exception("[RAGAS_EVALUATOR_LLM_PATCH] OpenAI async completion request failed")
+        _add_llm_trace(messages, expected_top_level, is_nli, error=e)
         raise
 
+    original_content = None
+    repaired_content = None
+    json_parse_success = None
     if hasattr(response, "choices") and response.choices:
         content = response.choices[0].message.content
         if content and isinstance(content, str):
+            original_content = content
             s_stripped = content.strip()
             is_json = s_stripped.startswith(("{", "[", "`"))
             if is_json:
-                response.choices[0].message.content = _normalize_json_response(
+                parsed, _ = _parse_json_content(content)
+                json_parse_success = (parsed is not None)
+                repaired_content = _normalize_json_response(
                     content, expected_top_level, is_nli
                 )
+                response.choices[0].message.content = repaired_content
 
+    _add_llm_trace(
+        messages,
+        expected_top_level,
+        is_nli,
+        original_content=original_content,
+        repaired_content=repaired_content,
+        response=response,
+        json_parse_success=json_parse_success,
+    )
     return response
 
 
@@ -828,11 +942,12 @@ def init_evaluator(args_or_config: Any, dataset: Optional[Dataset] = None):
     """Initializes global evaluation settings, clients, LLMs, embeddings, and metrics based on consolidated config."""
     global openai_client, original_create, rag_client, ragas_llm, ragas_embeddings, metrics
     global rag_eval_retrieval_only, rag_eval_top_k
-    global ragas_prompt_tokens, ragas_completion_tokens
+    global ragas_prompt_tokens, ragas_completion_tokens, ragas_llm_traces
 
     # Reset token counters for a fresh run
     ragas_prompt_tokens = 0
     ragas_completion_tokens = 0
+    ragas_llm_traces = []
 
     config = _resolve_and_sync_config(args_or_config)
 
@@ -874,6 +989,7 @@ def load_enterprise_rag_bench(jsonl_path: Path) -> list[dict[str, Any]]:
                 item = json.loads(line)
                 data_samples.append(
                     {
+                        "question_id": item.get("question_id"),
                         "question": item["user_input"],
                         "user_input": item["user_input"],
                         "reference": item["reference"],
@@ -895,6 +1011,7 @@ def load_hotpotqa(jsonl_path: Path) -> list[dict[str, Any]]:
                 item = json.loads(line)
                 data_samples.append(
                     {
+                        "question_id": item.get("question_id"),
                         "question": item["user_input"],
                         "user_input": item["user_input"],
                         "reference": item["reference"],
@@ -911,18 +1028,21 @@ def load_mock_dataset() -> list[dict[str, Any]]:
     """Loads a mock/fallback dataset for simple testing"""
     return [
         {
+            "question_id": "mock_0001",
             "question": "What is ragas 0.3",
             "user_input": "What is ragas 0.3",
             "reference": "Ragas 0.3 focuses on experimentation as the central pillar, providing abstractions for datasets, experiments, and metrics. It supports evaluations for RAG, LLM workflows, and Agents.",
             "category": "basic",
         },
         {
+            "question_id": "mock_0002",
             "question": "how are experiment results stored in ragas 0.3?",
             "user_input": "how are experiment results stored in ragas 0.3?",
             "reference": "Experiment results are stored in different backends like local or GDrive, typically under an experiments/ folder in the backend storage.",
             "category": "basic",
         },
         {
+            "question_id": "mock_0003",
             "question": "What metrics are supported in ragas 0.3?",
             "user_input": "What metrics are supported in ragas 0.3?",
             "reference": "Ragas 0.3 provides abstractions for discrete, numerical, and ranking metrics.",
@@ -1024,6 +1144,7 @@ async def run_experiment(row):
     Phase 1: Run your RAG client pipeline exclusively.
     Do not run evaluations inside this individual row loop.
     """
+
     retrieval_only = (
         rag_eval_retrieval_only
         if rag_eval_retrieval_only is not None
@@ -1069,11 +1190,11 @@ async def run_experiment(row):
     total_tokens = usage.get("total_tokens", 0)
     log_file = response_data.get("logs", " ")
 
-    logger.info(f"\n[RAG PIPELINE RUN] Query: {row['question']!r}")
-    logger.info(f"  Generated Response: {answer!r}")
-    logger.info("  Retrieved Contexts:")
+    logger.debug(f"\n[RAG PIPELINE RUN] Query: {row['question']!r}")
+    logger.debug(f"  Generated Response: {answer!r}")
+    logger.debug("  Retrieved Contexts:")
     for idx, ctx in enumerate(retrieved_contexts):
-        logger.info(f"    [{idx+1}] {ctx[:200]!r}...")
+        logger.debug(f"    [{idx+1}] {ctx[:200]!r}...")
 
     return {
         **row,
@@ -1188,11 +1309,11 @@ def _prepare_eval_dataset(df: pd.DataFrame) -> EvaluationDataset:
     """Convert generated results into an EvaluationDataset batch."""
     samples = []
     for idx, (_, r) in enumerate(df.iterrows()):
-        logger.info(f"\n[RAGAS EVAL INPUT SAMPLE {idx+1}]")
-        logger.info(f"  User Input: {r['question']!r}")
-        logger.info(f"  Response: {r['response']!r}")
-        logger.info(f"  Retrieved Contexts: {r['retrieved_contexts']}")
-        logger.info(f"  Reference: {r['reference']!r}")
+        logger.debug(f"\n[RAGAS EVAL INPUT SAMPLE {idx+1}]")
+        logger.debug(f"  User Input: {r['question']!r}")
+        logger.debug(f"  Response: {r['response']!r}")
+        logger.debug(f"  Retrieved Contexts: {r['retrieved_contexts']}")
+        logger.debug(f"  Reference: {r['reference']!r}")
         samples.append(
             SingleTurnSample(
                 user_input=r["question"],
@@ -1370,6 +1491,39 @@ def _analyze_failures(df: pd.DataFrame) -> Tuple[float, float]:
     return avg_recall, avg_precision
 
 
+def _calculate_llm_parsing_stats() -> Dict[str, int]:
+    """Calculates operational statistics for the evaluator LLM calls."""
+    global ragas_llm_traces
+    total_calls = len(ragas_llm_traces)
+    api_errors = sum(1 for t in ragas_llm_traces if t.get("error") is not None)
+    successful_calls = total_calls - api_errors
+    empty_responses = sum(
+        1 for t in ragas_llm_traces 
+        if t.get("error") is None and t.get("original_content") is None
+    )
+    json_parse_success_count = sum(
+        1 for t in ragas_llm_traces if t.get("json_parse_success") is True
+    )
+    json_parse_failure_count = sum(
+        1 for t in ragas_llm_traces if t.get("json_parse_success") is False
+    )
+    non_json_responses = sum(
+        1 for t in ragas_llm_traces 
+        if t.get("error") is None 
+        and t.get("original_content") is not None 
+        and t.get("json_parse_success") is None
+    )
+    return {
+        "total_calls": total_calls,
+        "api_errors": api_errors,
+        "successful_calls": successful_calls,
+        "empty_responses": empty_responses,
+        "json_parse_success": json_parse_success_count,
+        "json_parse_failures": json_parse_failure_count,
+        "non_json_responses": non_json_responses,
+    }
+
+
 def _log_metrics_summary(
     config: Dict[str, Any],
     df: pd.DataFrame,
@@ -1417,6 +1571,16 @@ def _log_metrics_summary(
     logger.info(f"  Completion Tokens: {ragas_completion_tokens}")
     logger.info(f"  Total Evaluator Tokens: {total_ragas_tokens}")
 
+    stats = _calculate_llm_parsing_stats()
+    logger.info("\n--- EVALUATOR LLM PARSING & QUALITY STATS ---")
+    logger.info(f"  Total LLM Calls: {stats['total_calls']}")
+    logger.info(f"  Successful LLM Responses: {stats['successful_calls']}")
+    logger.info(f"  API/Connection Errors: {stats['api_errors']}")
+    logger.info(f"  Empty Choices/Responses: {stats['empty_responses']}")
+    logger.info(f"  Successful JSON Parses: {stats['json_parse_success']}")
+    logger.info(f"  JSON Parsing/Repair Failures: {stats['json_parse_failures']}")
+    logger.info(f"  Plain Text / Non-JSON Responses: {stats['non_json_responses']}")
+
     logger.info("\n--- QUALITY METRICS AVERAGE ---")
     for m in metric_names:
         avg_val = df[m].mean() if (not df.empty and m in df.columns) else 0.0
@@ -1456,11 +1620,48 @@ async def _save_evaluation_outputs(
     # Copy DataFrame to avoid modifying caller's data
     df = df.copy()
 
-    # Add evaluator metrics columns
+    # Initialize per-row token counters in df
+    df["evaluator_prompt_tokens"] = 0
+    df["evaluator_completion_tokens"] = 0
+    df["evaluator_total_tokens"] = 0
     df["evaluator_evaluation_time_seconds"] = evaluation_time
-    df["evaluator_prompt_tokens"] = ragas_prompt_tokens
-    df["evaluator_completion_tokens"] = ragas_completion_tokens
-    df["evaluator_total_tokens"] = ragas_prompt_tokens + ragas_completion_tokens
+
+    # Match and attribute trace token usage back to individual rows
+    for trace in ragas_llm_traces:
+        usage = trace.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        p_tokens = usage.get("prompt_tokens", 0)
+        c_tokens = usage.get("completion_tokens", 0)
+
+        # Concatenate prompt message content to check for substrings
+        prompt_text = " ".join(
+            [
+                m.get("content", "")
+                for m in trace.get("messages", [])
+                if isinstance(m, dict)
+            ]
+        )
+
+        matched_idx = None
+        for idx, row in df.iterrows():
+            q = row.get("question")
+            ans = row.get("response")
+            ref = row.get("reference")
+
+            # Check if any identifier unique to this row appears in the prompt messages
+            if (
+                (q and q in prompt_text)
+                or (ans and ans in prompt_text)
+                or (ref and ref in prompt_text)
+            ):
+                matched_idx = idx
+                break
+
+        if matched_idx is not None:
+            df.at[matched_idx, "evaluator_prompt_tokens"] += p_tokens
+            df.at[matched_idx, "evaluator_completion_tokens"] += c_tokens
+            df.at[matched_idx, "evaluator_total_tokens"] += p_tokens + c_tokens
 
     # Create a summary row with overall averages
     summary_row: dict[str, Any] = dict.fromkeys(df.columns, "")
@@ -1473,14 +1674,15 @@ async def _save_evaluation_outputs(
     summary_row["retrieval_precision"] = avg_precision
     summary_row["failure_cause"] = "N/A"
     summary_row["evaluator_evaluation_time_seconds"] = evaluation_time
-    summary_row["evaluator_prompt_tokens"] = ragas_prompt_tokens
-    summary_row["evaluator_completion_tokens"] = ragas_completion_tokens
-    summary_row["evaluator_total_tokens"] = ragas_prompt_tokens + ragas_completion_tokens
+    summary_row["evaluator_prompt_tokens"] = df["evaluator_prompt_tokens"].mean() if not df.empty else 0.0
+    summary_row["evaluator_completion_tokens"] = df["evaluator_completion_tokens"].mean() if not df.empty else 0.0
+    summary_row["evaluator_total_tokens"] = df["evaluator_total_tokens"].mean() if not df.empty else 0.0
 
     df_with_summary = pd.concat([df, pd.DataFrame([summary_row])], ignore_index=True)
     await asyncio.to_thread(df_with_summary.to_csv, csv_path, index=False)
     logger.info(f"\nDetailed results saved to: {csv_path.resolve()}")
 
+    parsing_stats = _calculate_llm_parsing_stats()
     summary_json_path = output_dir / f"{experiment_name}_summary.json"
     summary_data = {
         "experiment_name": experiment_name,
@@ -1502,11 +1704,18 @@ async def _save_evaluation_outputs(
             "completion_tokens": ragas_completion_tokens,
             "total_tokens": ragas_prompt_tokens + ragas_completion_tokens,
         },
+        "evaluator_parsing_stats": parsing_stats,
     }
 
     def save_json():
         with open(summary_json_path, "w") as f:
             json.dump(summary_data, f, indent=4)
+
+        traces_path = Path(".") / "evals" / "logs" / f"{experiment_name}_evaluator_traces.json"
+        traces_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(traces_path, "w") as f:
+            json.dump(ragas_llm_traces, f, indent=2)
+        logger.info(f"Evaluator LLM traces saved to: {traces_path.resolve()}")
 
     await asyncio.to_thread(save_json)
     logger.info(f"Summary metrics saved to: {summary_json_path.resolve()}")
@@ -1662,4 +1871,8 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
     asyncio.run(main())

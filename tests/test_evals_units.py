@@ -688,6 +688,84 @@ def test_save_evaluation_outputs_negative():
     )
 
 
+def test_save_evaluation_outputs_token_attribution(tmp_path):
+    # Positive & Negative: test prompt-matching token attribution to rows
+    df = pd.DataFrame(
+        {
+            "question": ["what is CAIPE?", "how to tune compaction?"],
+            "response": ["CAIPE is a platform", "tune compaction by ms"],
+            "reference": ["platform info", "compaction knobs"],
+            "latency": [1.0, 2.0],
+            "total_tokens": [100, 200],
+            "retrieval_recall": [1.0, 1.0],
+            "retrieval_precision": [1.0, 1.0],
+            "failure_cause": ["none", "none"],
+        }
+    )
+
+    # Set up mock traces with unique content mapping to rows
+    evals.ragas_llm_traces = [
+        # Match row 0 via question substring
+        {
+            "messages": [{"role": "user", "content": "Help me answer: what is CAIPE?"}],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20},
+        },
+        # Match row 1 via response substring
+        {
+            "messages": [{"role": "system", "content": "Check statement: tune compaction by ms against context"}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40},
+        },
+        # Match row 0 via reference substring
+        {
+            "messages": [{"role": "user", "content": "Analyze references: platform info"}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 25, "total_tokens": 75},
+        },
+        # Unmatched trace (should be ignored)
+        {
+            "messages": [{"role": "user", "content": "some unrelated question"}],
+            "usage": {"prompt_tokens": 500, "completion_tokens": 250, "total_tokens": 750},
+        },
+        # Invalid usage trace (should be ignored safely)
+        {
+            "messages": [{"role": "user", "content": "what is CAIPE?"}],
+            "usage": "<Mock: MagicMock>",
+        }
+    ]
+
+    (tmp_path / "evals").mkdir()
+    with mock.patch("ragas_eval.evals.Path") as mock_path:
+        mock_path.return_value = tmp_path
+        mock_path.side_effect = lambda *args: Path(tmp_path, *args)
+
+        asyncio.get_event_loop().run_until_complete(
+            evals._save_evaluation_outputs(
+                experiment_name="test_attr_exp",
+                df=df,
+                metric_names=[],
+                avg_recall=1.0,
+                avg_precision=1.0,
+                config_args={},
+                evaluation_time=5.0,
+                datasource="mock",
+            )
+        )
+
+        csv_file = tmp_path / "evals" / "experiments" / "test_attr_exp.csv"
+        assert csv_file.exists()
+
+        csv_df = pd.read_csv(csv_file)
+        
+        # Row 0 matches trace 1 (15p, 5c) and trace 3 (50p, 25c) -> total 65p, 30c
+        assert csv_df.loc[0, "evaluator_prompt_tokens"] == 65
+        assert csv_df.loc[0, "evaluator_completion_tokens"] == 30
+        assert csv_df.loc[0, "evaluator_total_tokens"] == 95
+
+        # Row 1 matches trace 2 (30p, 10c) -> total 30p, 10c
+        assert csv_df.loc[1, "evaluator_prompt_tokens"] == 30
+        assert csv_df.loc[1, "evaluator_completion_tokens"] == 10
+        assert csv_df.loc[1, "evaluator_total_tokens"] == 40
+
+
 class TestNormalize:
     def test_lowercase(self):
         assert _normalize("YES") == "yes"

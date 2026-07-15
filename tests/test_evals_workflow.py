@@ -507,7 +507,7 @@ async def test_evals_main_workflow(tmp_path):
             # Assert evaluate was invoked on constructed dataset
             mock_evaluate.assert_called_once()
             mock_to_csv.assert_called_once()
-            mock_file_open.assert_called_once()
+            assert mock_file_open.call_count == 2
 
 
 @pytest.mark.asyncio
