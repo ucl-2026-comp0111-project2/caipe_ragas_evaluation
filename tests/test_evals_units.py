@@ -451,10 +451,25 @@ def test_load_samples_from_source(tmp_path):
 
 
 def test_filter_samples_by_category():
-    # Positive: exact match
-    samples = [{"category": "catA"}, {"category": "catB"}]
+    # Positive: exact match without level
+    samples = [{"category": "catA"}, {"category": "catB"}, {"category": "catA"}]
     filtered = evals._filter_samples_by_category(samples, 1)
     assert len(filtered) == 2
+    assert [s["category"] for s in filtered] == ["catA", "catB"]
+
+    # Positive: with level (category+level unique combination)
+    samples_with_level = [
+        {"category": "catA", "level": "easy"},
+        {"category": "catA", "level": "easy"},  # should be filtered out
+        {"category": "catA", "level": "hard"},  # should be kept (unique combination)
+        {"category": "catB", "level": "easy"},
+    ]
+    filtered_level = evals._filter_samples_by_category(samples_with_level, 1)
+    assert len(filtered_level) == 3
+    assert filtered_level[0] == {"category": "catA", "level": "easy"}
+    assert filtered_level[1] == {"category": "catA", "level": "hard"}
+    assert filtered_level[2] == {"category": "catB", "level": "easy"}
+
 
 
 def test_load_dataset():
@@ -614,6 +629,16 @@ def test_save_evaluation_outputs_positive(tmp_path):
         json_file = tmp_path / "evals" / "experiments" / "test_exp_summary.json"
         assert csv_file.exists()
         assert json_file.exists()
+
+        # Load and verify CSV contents
+        csv_df = pd.read_csv(csv_file)
+        for col in [
+            "evaluator_evaluation_time_seconds",
+            "evaluator_prompt_tokens",
+            "evaluator_completion_tokens",
+            "evaluator_total_tokens",
+        ]:
+            assert col in csv_df.columns
 
         # Load and verify JSON contents
         with open(json_file, "r") as f:
@@ -875,14 +900,26 @@ def test_load_hotpotqa(tmp_path):
             "reference": "Ref1",
             "expected_doc_ids": ["doc1"],
             "category": "cat1",
+            "level": "hard",
+        },
+        {
+            "user_input": "Q2",
+            "reference": "Ref2",
+            "expected_doc_ids": ["doc2"],
+            "category": "cat2",
         }
     ]
     with open(jsonl_file, "w") as f:
-        f.write(json.dumps(data[0]) + "\n")
+        for item in data:
+            f.write(json.dumps(item) + "\n")
 
     samples = load_hotpotqa(jsonl_file)
-    assert len(samples) == 1
+    assert len(samples) == 2
     assert samples[0]["question"] == "Q1"
+    assert samples[0]["level"] == "hard"
+    assert samples[1]["question"] == "Q2"
+    assert samples[1]["level"] == "easy"
+
 
 
 def test_load_hotpotqa_negative():

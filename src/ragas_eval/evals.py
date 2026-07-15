@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 
 # Disable Ragas anonymous telemetry and background thread
 os.environ["RAGAS_DO_NOT_TRACK"] = "true"
@@ -895,9 +896,11 @@ def load_hotpotqa(jsonl_path: Path) -> list[dict[str, Any]]:
                         "reference": item["reference"],
                         "expected_doc_ids": item.get("expected_doc_ids", []),
                         "category": item.get("category", "basic"),
+                        "level": item.get("level", "easy"),
                     }
                 )
     return data_samples
+
 
 
 def load_mock_dataset() -> list[dict[str, Any]]:
@@ -964,11 +967,14 @@ def _filter_samples_by_category(
     filtered_samples = []
     for sample in data_samples:
         cat = sample.get("category", "basic")
+        if "level" in sample:
+            cat = f"{cat}_{sample['level']}"
         count = category_counts.get(cat, 0)
         if count < limit_per_category:
             filtered_samples.append(sample)
             category_counts[cat] = count + 1
     return filtered_samples
+
 
 
 def load_dataset(
@@ -1438,9 +1444,19 @@ async def _save_evaluation_outputs(
     datasource: Optional[str],
 ) -> None:
     """Save the results DataFrame to CSV and companion JSON summary asynchronously."""
+    global ragas_prompt_tokens, ragas_completion_tokens
     output_dir = Path(".") / "evals" / "experiments"
     output_dir.mkdir(exist_ok=True)
     csv_path = output_dir / f"{experiment_name}.csv"
+
+    # Copy DataFrame to avoid modifying caller's data
+    df = df.copy()
+
+    # Add evaluator metrics columns
+    df["evaluator_evaluation_time_seconds"] = evaluation_time
+    df["evaluator_prompt_tokens"] = ragas_prompt_tokens
+    df["evaluator_completion_tokens"] = ragas_completion_tokens
+    df["evaluator_total_tokens"] = ragas_prompt_tokens + ragas_completion_tokens
 
     # Create a summary row with overall averages
     summary_row: dict[str, Any] = dict.fromkeys(df.columns, "")
@@ -1452,6 +1468,10 @@ async def _save_evaluation_outputs(
     summary_row["retrieval_recall"] = avg_recall
     summary_row["retrieval_precision"] = avg_precision
     summary_row["failure_cause"] = "N/A"
+    summary_row["evaluator_evaluation_time_seconds"] = evaluation_time
+    summary_row["evaluator_prompt_tokens"] = ragas_prompt_tokens
+    summary_row["evaluator_completion_tokens"] = ragas_completion_tokens
+    summary_row["evaluator_total_tokens"] = ragas_prompt_tokens + ragas_completion_tokens
 
     df_with_summary = pd.concat([df, pd.DataFrame([summary_row])], ignore_index=True)
     await asyncio.to_thread(df_with_summary.to_csv, csv_path, index=False)
@@ -1538,11 +1558,11 @@ async def main():
     init_evaluator(config, dataset=dataset)
 
     datasource_name = config.get("ragas_datasource")
-    memorable_name = memorable_names.generate_unique_name()
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     if isinstance(datasource_name, str) and datasource_name.strip():
-        experiment_name = f"{datasource_name.strip()}_{memorable_name}"
+        experiment_name = f"{datasource_name.strip()}_{now_str}"
     else:
-        experiment_name = memorable_name
+        experiment_name = now_str
 
     try:
         logger.info("\n--- PHASE 1: RUNNING RAG PIPELINE GENERATION ---")
@@ -1577,6 +1597,39 @@ async def main():
         config_args = {
             k: v for k, v in vars(args).items() if v is not None and k != "openai_api_key"
         }
+
+        # Combine detailed log files if they exist
+        combined_log_path_str = " "
+        if "log_file" in df.columns:
+            log_files = df["log_file"].dropna().unique()
+            valid_log_files = []
+            combined_logs = []
+            for lf in log_files:
+                lf_str = str(lf).strip()
+                if lf_str and lf_str != "N/A" and os.path.exists(lf_str):
+                    try:
+                        with open(lf_str, "r") as f:
+                            combined_logs.append(json.load(f))
+                        valid_log_files.append(lf_str)
+                    except Exception as e:
+                        logger.warning(f"Failed to read log file {lf_str}: {e}")
+
+            if combined_logs:
+                combined_log_path = Path("evals") / "logs" / f"{experiment_name}_detailed.json"
+                combined_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(combined_log_path, "w") as f:
+                    json.dump(combined_logs, f, indent=2)
+                logger.info(f"Combined detailed logs saved to: {combined_log_path.resolve()}")
+                combined_log_path_str = str(combined_log_path)
+
+                # Clean up the individual log files
+                for lf_str in valid_log_files:
+                    try:
+                        os.remove(lf_str)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete individual log file {lf_str}: {e}")
+
+        df["log_file"] = combined_log_path_str
 
         await _save_evaluation_outputs(
             experiment_name=experiment_name,
