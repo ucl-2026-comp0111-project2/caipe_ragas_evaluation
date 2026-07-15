@@ -15,12 +15,15 @@ export CAIPE_DATASOURCE_ID="hotpotqa_sample"
 export RAGAS_DATASOURCE="hotpotqa"
 export QUESTIONS_PATH="data/hotpotqa_full_questions.jsonl"
 export RAG_EVAL_SHORT_ANSWER="true"
+export CAIPE_OIDC_TOKEN_URL="https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token"
 
 # Fetch OIDC credentials from Kubernetes
 # Assumption: CAIPE is deployed using KinD (Kubernetes in Docker) with OIDC enabled.
 # The credentials (Client ID and Secret) are fetched directly from the Kubernetes cluster secret 'caipe-ui-secret' in the 'caipe' namespace.
 CLIENT_ID=$(kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_ID}' | base64 --decode)
 CLIENT_SECRET=$(kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_SECRET}' | base64 --decode)
+export CAIPE_CLIENT_ID="${CLIENT_ID}"
+export CAIPE_CLIENT_SECRET="${CLIENT_SECRET}"
 
 # Fetch OIDC token from Keycloak
 export CAIPE_OIDC_TOKEN=$(curl -sk -X POST "https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token" \
@@ -46,4 +49,4 @@ export PYTHONPATH=src:$PYTHONPATH
 
 # Activate virtual environment and run evaluation
 # shellcheck source=.venv/bin/activate
-uv run python3 -m ragas_eval.evals --limit-per-category 1 --top-k 5 --short-answer  --agentic 
+uv run python3 -m ragas_eval.evals --limit 1 --top-k 5 --short-answer  --agentic --enable-trace-log

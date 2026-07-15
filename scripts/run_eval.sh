@@ -15,6 +15,8 @@ fi
 # The credentials (Client ID and Secret) are fetched directly from the Kubernetes cluster secret 'caipe-ui-secret' in the 'caipe' namespace.
 CLIENT_ID=$(kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_ID}' | base64 --decode)
 CLIENT_SECRET=$(kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_SECRET}' | base64 --decode)
+export CAIPE_CLIENT_ID="${CLIENT_ID}"
+export CAIPE_CLIENT_SECRET="${CLIENT_SECRET}"
 
 # Fetch OIDC token from Keycloak
 export CAIPE_OIDC_TOKEN=$(curl -sk -X POST "https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token" \

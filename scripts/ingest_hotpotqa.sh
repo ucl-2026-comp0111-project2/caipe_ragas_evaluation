@@ -26,4 +26,4 @@ export CAIPE_OIDC_TOKEN=$(curl -k -s -X POST "https://keycloak.caipe.homelab/rea
 export PYTHONPATH=src:$PYTHONPATH
 
 # Run the ingestion script passing through any CLI arguments
-uv run python3 -m ragas_eval.hotpotqa_rag_ingest --rag-url https://rag.caipe.homelab --insecure --limit-per-category 1000 --input-file data/hotpotqa_full_document_pool.jsonl --prioritize-reference "$@"
+uv run python3 -m ragas_eval.hotpotqa_rag_ingest --rag-url https://rag.caipe.homelab --oidc-token-url "https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token" --oidc-client-id "${CLIENT_ID}" --oidc-client-secret "${CLIENT_SECRET}" --insecure --limit-per-category 1000 --input-file data/hotpotqa_full_document_pool.jsonl --prioritize-reference "$@"
