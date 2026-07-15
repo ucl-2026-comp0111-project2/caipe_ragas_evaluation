@@ -898,8 +898,8 @@ def _init_metrics(
     """Initialize Ragas metrics based on run mode flags.
 
     Pass --short-answer for HotpotQA-style datasets with single-word/phrase references.
-    This replaces FactualCorrectness + ContextPrecision (which rely on NLI claim extraction
-    and produce 0.0 on short references) with SemanticSimilarity + ContainsAnswer.
+    This retains all baseline metrics (FactualCorrectness, Faithfulness, AnswerRelevancy,
+    ContextPrecision, ContextRecall) and adds SemanticSimilarity and ContainsAnswer.
     """
     retrieval_only = config["rag_eval_retrieval_only"]
     generation_only = config["rag_eval_generation_only"]
@@ -911,31 +911,30 @@ def _init_metrics(
             ContextRecall(llm=ragas_llm),
         ]
     if generation_only:
-        if short_answer:
-            return [
-                SemanticSimilarity(embeddings=ragas_embeddings),
-                ContainsAnswer(),
-                AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
-            ]
-        return [
+        base_metrics = [
             FactualCorrectness(llm=ragas_llm),
             AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
         ]
-    if short_answer:
-        return [
-            SemanticSimilarity(embeddings=ragas_embeddings),
-            ContainsAnswer(),
-            Faithfulness(llm=ragas_llm),
-            AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
-            ContextRecall(llm=ragas_llm),
-        ]
-    return [
+        if short_answer:
+            base_metrics.extend([
+                SemanticSimilarity(embeddings=ragas_embeddings),
+                ContainsAnswer(),
+            ])
+        return base_metrics
+
+    base_metrics = [
         FactualCorrectness(llm=ragas_llm),
         Faithfulness(llm=ragas_llm),
         AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
         ContextPrecision(llm=ragas_llm),
         ContextRecall(llm=ragas_llm),
     ]
+    if short_answer:
+        base_metrics.extend([
+            SemanticSimilarity(embeddings=ragas_embeddings),
+            ContainsAnswer(),
+        ])
+    return base_metrics
 
 
 def init_evaluator(args_or_config: Any, dataset: Optional[Dataset] = None):

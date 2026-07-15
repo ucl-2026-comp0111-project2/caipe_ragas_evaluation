@@ -1043,7 +1043,11 @@ def test_init_metrics_short_answer_positive():
     names = [m.name for m in metrics_list]
     assert "semantic_similarity" in names
     assert "contains_answer" in names
-    assert "factual_correctness" not in names
+    assert "factual_correctness" in names
+    assert "faithfulness" in names
+    assert "answer_relevancy" in names
+    assert "context_precision" in names
+    assert "context_recall" in names
 
 
 def test_init_metrics_short_answer_negative():
