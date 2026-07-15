@@ -77,6 +77,27 @@ def test_parse_json_content():
     assert content == ["json"]
 
 
+def test_parse_json_content_with_escaped_quotes():
+    # Test that valid JSON with nested escaped quotes inside a string value
+    # is parsed correctly and not corrupted/split by unescaping logic.
+    raw_json = """{
+      "classifications": [
+        {
+          "statement": "The default limits are 10 MiB.",
+          "reason": "The context explicitly states: \\"Enforce configurable limits: max_file_size (default 10MiB)\\" and \\"Default limits: 10MiB per file\\". This is supported.",
+          "attributed": 1
+        }
+      ]
+    }"""
+    content, repaired = evals._parse_json_content(raw_json)
+    assert content is not None
+    assert "classifications" in content
+    assert len(content["classifications"]) == 1
+    item = content["classifications"][0]
+    assert item["attributed"] == 1
+    assert "Enforce configurable limits" in item["reason"]
+
+
 def test_normalize_key_name():
     # Positive
     assert evals._normalize_key_name("Claims ") == "claims"

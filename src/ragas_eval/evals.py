@@ -21,7 +21,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 from ragas import Dataset, experiment, evaluate, EvaluationDataset  # noqa: E402
-from ragas.utils import memorable_names  # noqa: E402
 from ragas.llms import llm_factory  # noqa: E402
 from ragas.embeddings import BaseRagasEmbedding  # noqa: E402
 from ragas.embeddings.base import embedding_factory  # noqa: E402
@@ -123,18 +122,23 @@ def _parse_json_content(content: str) -> tuple[Optional[Any], Optional[str]]:
     import json_repair
     import json
 
+    # Try parsing the original content first to preserve valid escaped internal quotes
+    repaired_content = json_repair.repair_json(content)
+    try:
+        parsed = json.loads(repaired_content)
+        if parsed is not None:
+            return parsed, repaired_content
+    except Exception:
+        pass
+
+    # Fallback to unescaping structural quotes only if the original parsing fails
     unescaped = content.replace('\\\\"', '"').replace('\\"', '"')
     repaired_content = json_repair.repair_json(unescaped)
     try:
         parsed = json.loads(repaired_content)
         return parsed, repaired_content
     except Exception:
-        repaired_content = json_repair.repair_json(content)
-        try:
-            parsed = json.loads(repaired_content)
-            return parsed, repaired_content
-        except Exception:
-            return None, repaired_content
+        return None, repaired_content
 
 
 def _normalize_key_name(k: str) -> str:
