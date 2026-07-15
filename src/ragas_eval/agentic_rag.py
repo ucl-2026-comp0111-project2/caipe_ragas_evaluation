@@ -4,6 +4,8 @@ import hashlib
 import logging
 import re
 import uuid
+import base64
+import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -241,6 +243,71 @@ class AgenticRetriever(BaseRetriever):
             logger.exception("Unexpected error calling caipe-supervisor A2A endpoint")
             return None
 
+    def _get_oidc_token(self) -> Optional[str]:
+        """Fetch OIDC token dynamically using client credentials, falling back to environment variables."""
+        client_id = os.getenv("CAIPE_CLIENT_ID") or os.getenv("CLIENT_ID")
+        client_secret = os.getenv("CAIPE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET")
+
+        if not client_id or not client_secret:
+            logger.info("Credentials not in environment. Attempting to fetch from Kubernetes secret 'caipe-ui-secret'...")
+            try:
+                client_id_cmd = "kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_ID}'"
+                client_secret_cmd = "kubectl get secret caipe-ui-secret -n caipe -o jsonpath='{.data.OIDC_CLIENT_SECRET}'"
+                client_id_b64 = subprocess.check_output(client_id_cmd, shell=True, stderr=subprocess.DEVNULL).decode().strip()
+                client_secret_b64 = subprocess.check_output(client_secret_cmd, shell=True, stderr=subprocess.DEVNULL).decode().strip()
+                if client_id_b64 and client_secret_b64:
+                    client_id = base64.b64decode(client_id_b64).decode()
+                    client_secret = base64.b64decode(client_secret_b64).decode()
+                    os.environ["CAIPE_CLIENT_ID"] = client_id
+                    os.environ["CAIPE_CLIENT_SECRET"] = client_secret
+                    logger.info("Successfully fetched OIDC credentials from Kubernetes.")
+            except Exception as e:
+                logger.debug("Could not fetch credentials from Kubernetes: %s", e)
+
+        if client_id and client_secret:
+            keycloak_url = os.getenv("CAIPE_OIDC_TOKEN_URL") or os.getenv("CAIPE_KEYCLOAK_URL")
+            if not keycloak_url:
+                if "caipe.homelab" in self.agent_api_url:
+                    keycloak_url = "https://keycloak.caipe.homelab/realms/caipe/protocol/openid-connect/token"
+                else:
+                    keycloak_url = "http://localhost:7080/realms/caipe/protocol/openid-connect/token"
+
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    logger.info("Fetching a fresh OIDC token from Keycloak (attempt %d/%d): %s", attempt, max_attempts, keycloak_url)
+                    resp = httpx.post(
+                        keycloak_url,
+                        data={
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "grant_type": "client_credentials",
+                        },
+                        verify=not self.insecure,
+                        timeout=15.0,
+                    )
+                    resp.raise_for_status()
+                    token = resp.json().get("access_token")
+                    if token:
+                        os.environ["CAIPE_OIDC_TOKEN"] = token
+                        return token
+                except Exception as e:
+                    logger.error(
+                        "Attempt %d/%d: Failed to fetch fresh OIDC token from Keycloak: %s",
+                        attempt,
+                        max_attempts,
+                        e,
+                    )
+                    if attempt < max_attempts:
+                        import time
+                        time.sleep(1.0)
+                    else:
+                        raise RuntimeError(
+                            f"Failed to fetch OIDC token from Keycloak after {max_attempts} attempts: {e}"
+                        ) from e
+
+        return os.getenv("CAIPE_OIDC_TOKEN") or os.getenv("BEARER_TOKEN")
+
     def _query_gateway(
         self,
         question: str,
@@ -249,54 +316,6 @@ class AgenticRetriever(BaseRetriever):
         trace_log: Optional[bool] = None,
     ) -> List[tuple]:
         """Send query to the streaming BFF gateway endpoints."""
-        token = os.getenv("CAIPE_OIDC_TOKEN") or os.getenv("BEARER_TOKEN")
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        agent_id = os.getenv("CAIPE_AGENT_ID") or "hello-world"
-
-        # Step 1: Create a new conversation session
-        conv_url = f"{self.agent_api_url.rstrip('/')}/api/chat/conversations"
-        conv_payload = {
-            "title": "Ragas Session",
-            "client_type": "webui",
-            "agent_id": agent_id,
-        }
-
-        try:
-            logger.info("Creating conversation session on %s...", conv_url)
-            r_conv = httpx.post(
-                conv_url,
-                json=conv_payload,
-                headers=headers,
-                verify=not self.insecure,
-                timeout=self.timeout,
-            )
-            r_conv.raise_for_status()
-            conv_data = r_conv.json()
-            conversation_id = conv_data["data"]["conversation"]["_id"]
-            logger.info("Conversation session created with ID: %s", conversation_id)
-        except Exception:
-            logger.exception("Failed to create conversation session on gateway")
-            return []
-
-        # Step 2: Stream the chat start request
-        stream_url = f"{self.agent_api_url.rstrip('/')}/api/v1/chat/stream/start"
-        stream_payload = {
-            "message": question,
-            "conversation_id": conversation_id,
-            "agent_id": agent_id,
-            "protocol": "custom",
-            "client_context": {
-                "source": "eval",
-                "tool_result_display_limit": -1,
-            },
-        }
-
-        raw_contexts = []
-        self.last_answer = ""
-
         # Resolve trace_log
         should_trace = trace_log
         if should_trace is None:
@@ -313,75 +332,189 @@ class AgenticRetriever(BaseRetriever):
             try:
                 log_file = open(log_filepath, "w")
                 logger.info("Capturing agentic stream log to %s", log_filepath)
+                log_file.write(f"--- RAG QUERY START (run_id: {run_id}) ---\n")
+                log_file.write(f"Question: {question}\n")
+                log_file.write(f"Agent URL: {self.agent_api_url}\n\n")
+                log_file.flush()
             except Exception:
                 logger.exception("Failed to open agentic stream log file %s", log_filepath)
 
         try:
-            logger.info("Streaming query from %s...", stream_url)
-            with httpx.stream(
-                "POST",
-                stream_url,
-                json=stream_payload,
-                headers=headers,
-                verify=not self.insecure,
-                timeout=self.timeout,
-            ) as response:
-                if response.status_code != 200:
-                    try:
-                        err_body = response.read().decode("utf-8")
-                        logger.error(
-                            "Gateway stream start returned HTTP %s: %s",
-                            response.status_code,
-                            err_body,
-                        )
-                    except Exception:
-                        logger.error(
-                            "Gateway stream start returned HTTP %s (failed to read body)",
-                            response.status_code,
-                        )
-                response.raise_for_status()
-                current_event = None
-                for line in response.iter_lines():
-                    if line:
-                        if log_file:
-                            if line.startswith("event: "):
-                                log_file.write(f"\n[{line}]\n")
-                            elif line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                try:
-                                    data_json = json.loads(data_str)
-                                    log_file.write(json.dumps(data_json, indent=2) + "\n")
-                                except Exception:
-                                    log_file.write(line + "\n")
-                            else:
-                                log_file.write(line + "\n")
-                            log_file.flush()
+            token = self._get_oidc_token()
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
 
-                        if line.startswith("event: "):
-                            current_event = line[7:].strip()
-                            if current_event in ("tool_start", "tool_end"):
-                                self.last_answer = ""
-                        elif line.startswith("data: "):
-                            data_str = line[6:].strip()
+            agent_id = os.getenv("CAIPE_AGENT_ID") or "hello-world"
+
+            # Step 1: Create a new conversation session (with retry)
+            conv_url = f"{self.agent_api_url.rstrip('/')}/api/chat/conversations"
+            conv_payload = {
+                "title": "Ragas Session",
+                "client_type": "webui",
+                "agent_id": agent_id,
+            }
+
+            max_attempts = 3
+            conversation_id = None
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    logger.info("Creating conversation session on %s (attempt %d/%d)...", conv_url, attempt, max_attempts)
+                    if log_file:
+                        log_file.write(f"Creating conversation session on {conv_url} (attempt {attempt}/{max_attempts})...\n")
+                        log_file.flush()
+                    r_conv = httpx.post(
+                        conv_url,
+                        json=conv_payload,
+                        headers=headers,
+                        verify=not self.insecure,
+                        timeout=self.timeout,
+                    )
+                    if r_conv.status_code == 401:
+                        logger.warning("Gateway returned 401 Unauthorized. Attempting token refresh...")
+                        if log_file:
+                            log_file.write("Gateway returned 401 Unauthorized. Attempting token refresh...\n")
+                            log_file.flush()
+                        if os.getenv("CAIPE_OIDC_TOKEN"):
+                            del os.environ["CAIPE_OIDC_TOKEN"]
+                        token = self._get_oidc_token()
+                        if token:
+                            headers["Authorization"] = f"Bearer {token}"
+                            logger.info("Retrying conversation session creation with fresh token...")
+                            if log_file:
+                                log_file.write("Retrying conversation session creation with fresh token...\n")
+                                log_file.flush()
+                            r_conv = httpx.post(
+                                conv_url,
+                                json=conv_payload,
+                                headers=headers,
+                                verify=not self.insecure,
+                                timeout=self.timeout,
+                            )
+                    r_conv.raise_for_status()
+                    conv_data = r_conv.json()
+                    conversation_id = conv_data["data"]["conversation"]["_id"]
+                    logger.info("Conversation session created with ID: %s", conversation_id)
+                    if log_file:
+                        log_file.write(f"Conversation session created with ID: {conversation_id}\n\n")
+                        log_file.flush()
+                    break
+                except Exception as e:
+                    logger.exception("Failed to create conversation session on gateway")
+                    if log_file:
+                        log_file.write(f"Failed to create conversation session on gateway (attempt {attempt}/{max_attempts}): {e}\n")
+                        log_file.flush()
+                    if attempt < max_attempts:
+                        import time
+                        time.sleep(1.0)
+                    else:
+                        raise RuntimeError(
+                            f"Failed to create conversation session on gateway after {max_attempts} attempts: {e}"
+                        ) from e
+
+            # Step 2: Stream the chat start request (with retry)
+            stream_url = f"{self.agent_api_url.rstrip('/')}/api/v1/chat/stream/start"
+            stream_payload = {
+                "message": question,
+                "conversation_id": conversation_id,
+                "agent_id": agent_id,
+                "protocol": "custom",
+                "client_context": {
+                    "source": "eval",
+                    "tool_result_display_limit": -1,
+                },
+            }
+
+            raw_contexts = []
+            self.last_answer = ""
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    logger.info("Streaming query from %s (attempt %d/%d)...", stream_url, attempt, max_attempts)
+                    if log_file:
+                        log_file.write(f"Streaming query from {stream_url} (attempt {attempt}/{max_attempts})...\n")
+                        log_file.flush()
+                    with httpx.stream(
+                        "POST",
+                        stream_url,
+                        json=stream_payload,
+                        headers=headers,
+                        verify=not self.insecure,
+                        timeout=self.timeout,
+                    ) as response:
+                        if response.status_code != 200:
                             try:
-                                data_json = json.loads(data_str)
+                                err_body = response.read().decode("utf-8")
+                                logger.error(
+                                    "Gateway stream start returned HTTP %s: %s",
+                                    response.status_code,
+                                    err_body,
+                                )
+                                if log_file:
+                                    log_file.write(f"Gateway stream start returned HTTP {response.status_code}: {err_body}\n")
+                                    log_file.flush()
                             except Exception:
-                                continue
-                            if current_event == "content":
-                                self.last_answer += data_json.get("text", "")
-                            elif current_event == "tool_end":
-                                tool_result = data_json.get("result", "")
-                                if tool_result:
-                                    raw_contexts.extend(
-                                        _parse_rag_context_artifact(tool_result)
-                                    )
-        except Exception:
-            logger.exception("Error during streaming query from gateway")
+                                logger.error(
+                                    "Gateway stream start returned HTTP %s (failed to read body)",
+                                    response.status_code,
+                                )
+                                if log_file:
+                                    log_file.write(f"Gateway stream start returned HTTP {response.status_code} (failed to read body)\n")
+                                    log_file.flush()
+                        response.raise_for_status()
+                        current_event = None
+                        for line in response.iter_lines():
+                            if line:
+                                if log_file:
+                                    if line.startswith("event: "):
+                                        log_file.write(f"\n[{line}]\n")
+                                    elif line.startswith("data: "):
+                                        data_str = line[6:].strip()
+                                        try:
+                                            data_json = json.loads(data_str)
+                                            log_file.write(json.dumps(data_json, indent=2) + "\n")
+                                        except Exception:
+                                            log_file.write(line + "\n")
+                                    else:
+                                        log_file.write(line + "\n")
+                                    log_file.flush()
+
+                                if line.startswith("event: "):
+                                    current_event = line[7:].strip()
+                                    if current_event in ("tool_start", "tool_end"):
+                                        self.last_answer = ""
+                                elif line.startswith("data: "):
+                                    data_str = line[6:].strip()
+                                    try:
+                                        data_json = json.loads(data_str)
+                                    except Exception:
+                                        continue
+                                    if current_event == "content":
+                                        self.last_answer += data_json.get("text", "")
+                                    elif current_event == "tool_end":
+                                        tool_result = data_json.get("result", "")
+                                        if tool_result:
+                                            raw_contexts.extend(
+                                                _parse_rag_context_artifact(tool_result)
+                                            )
+                    break
+                except Exception as e:
+                    logger.exception("Error during streaming query from gateway")
+                    if log_file:
+                        log_file.write(f"Error during streaming query (attempt {attempt}/{max_attempts}): {e}\n")
+                        log_file.flush()
+                    if attempt < max_attempts:
+                        import time
+                        time.sleep(1.0)
+                    else:
+                        raise RuntimeError(
+                            f"Error during streaming query from gateway after {max_attempts} attempts: {e}"
+                        ) from e
+            return raw_contexts
         finally:
             if log_file:
                 log_file.close()
-
-        return raw_contexts
 
     def get_top_k(
         self,

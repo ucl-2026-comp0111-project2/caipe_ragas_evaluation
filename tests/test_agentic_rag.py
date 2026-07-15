@@ -2,6 +2,7 @@ import os
 import unittest.mock as mock
 import requests
 import json
+import pytest
 
 from ragas_eval.agentic_rag import (
     clean_snippet_markdown,
@@ -364,10 +365,8 @@ def test_agentic_retriever_query_gateway_negative(mock_post):
     mock_post.side_effect = Exception("Connection error")
 
     ret = AgenticRetriever(agent_api_url="https://gateway.service", use_a2a=False)
-    res = ret._query_gateway("test question", k=1)
-
-    assert res == []
-    assert ret.last_answer == ""
+    with pytest.raises(RuntimeError, match="Failed to create conversation session on gateway"):
+        ret._query_gateway("test question", k=1)
 
 
 # ============================================================
