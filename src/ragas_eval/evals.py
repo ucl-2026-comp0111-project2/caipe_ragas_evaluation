@@ -5,6 +5,8 @@ from datetime import datetime
 # Disable Ragas anonymous telemetry and background thread
 os.environ["RAGAS_DO_NOT_TRACK"] = "true"
 
+import re
+import ast
 import json
 import time
 import logging
@@ -1600,6 +1602,45 @@ def _log_metrics_summary(
         logger.info("\nNo failure cause data available.")
 
 
+def _extract_json_from_prompt(prompt_text: str) -> Optional[Dict[str, Any]]:
+    """Helper to extract JSON input from prompt text, ignoring few-shot examples."""
+    matches = list(re.finditer(r'(?:input|Input|INPUT):\s*\{', prompt_text))
+    if not matches:
+        return None
+    
+    last_match = matches[-1]
+    start_idx = last_match.end() - 1
+    depth = 0
+    end_idx = -1
+    for i in range(start_idx, len(prompt_text)):
+        char = prompt_text[i]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                end_idx = i + 1
+                break
+    if end_idx != -1:
+        try:
+            return json.loads(prompt_text[start_idx:end_idx])
+        except Exception:
+            pass
+    return None
+
+
+def _safe_parse_list(val: Any) -> List[str]:
+    """Helper to parse a list from string representation in DataFrames."""
+    if not val or pd.isna(val):
+        return []
+    if isinstance(val, list):
+        return val
+    try:
+        return ast.literal_eval(val)
+    except Exception:
+        return [str(val)]
+
+
 async def _save_evaluation_outputs(
     experiment_name: str,
     df: pd.DataFrame,
@@ -1642,25 +1683,69 @@ async def _save_evaluation_outputs(
             ]
         )
 
-        matched_idx = None
+        input_data = _extract_json_from_prompt(prompt_text)
+
+        best_idx = None
+        best_score = 0
+
+        inp_q = input_data.get("question") if input_data else None
+        inp_ans = (input_data.get("response") or input_data.get("answer")) if input_data else None
+        inp_ref = input_data.get("reference") if input_data else None
+        inp_ctx = input_data.get("context") if input_data else None
+
         for idx, row in df.iterrows():
             q = row.get("question")
             ans = row.get("response")
             ref = row.get("reference")
+            contexts = _safe_parse_list(row.get("retrieved_contexts"))
 
-            # Check if any identifier unique to this row appears in the prompt messages
-            if (
-                (q and q in prompt_text)
-                or (ans and ans in prompt_text)
-                or (ref and ref in prompt_text)
-            ):
-                matched_idx = idx
-                break
+            score = 0
 
-        if matched_idx is not None:
-            df.at[matched_idx, "evaluator_prompt_tokens"] += p_tokens
-            df.at[matched_idx, "evaluator_completion_tokens"] += c_tokens
-            df.at[matched_idx, "evaluator_total_tokens"] += p_tokens + c_tokens
+            if input_data:
+                # Question match
+                if inp_q and q and str(inp_q).strip() == str(q).strip():
+                    score += 2000
+                # Response/Answer match (check both ans and ref since Ragas swaps them)
+                if inp_ans:
+                    if ans and str(inp_ans).strip() == str(ans).strip():
+                        score += 1500
+                    if ref and str(inp_ans).strip() == str(ref).strip():
+                        score += 1500
+                # Reference match (check both ans and ref)
+                if inp_ref:
+                    if ref and str(inp_ref).strip() == str(ref).strip():
+                        score += 1500
+                    if ans and str(inp_ref).strip() == str(ans).strip():
+                        score += 1500
+                # Context match (check retrieved contexts, response, and reference)
+                if inp_ctx:
+                    if ans and str(inp_ctx).strip() == str(ans).strip():
+                        score += 1200
+                    if ref and str(inp_ctx).strip() == str(ref).strip():
+                        score += 1200
+                    for ctx in contexts:
+                        if ctx and len(str(ctx)) > 20 and str(ctx).strip() in str(inp_ctx):
+                            score += 1000
+
+            # Substring fallback
+            if q and len(str(q)) > 10 and str(q) in prompt_text:
+                score += 500
+            if ans and len(str(ans)) > 10 and str(ans) in prompt_text:
+                score += 300
+            if ref and len(str(ref)) > 10 and str(ref) in prompt_text:
+                score += 300
+            for ctx in contexts:
+                if ctx and len(str(ctx)) > 20 and str(ctx) in prompt_text:
+                    score += 400
+
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is not None:
+            df.at[best_idx, "evaluator_prompt_tokens"] += p_tokens
+            df.at[best_idx, "evaluator_completion_tokens"] += c_tokens
+            df.at[best_idx, "evaluator_total_tokens"] += p_tokens + c_tokens
 
     # Create a summary row with overall averages
     summary_row: dict[str, Any] = dict.fromkeys(df.columns, "")
