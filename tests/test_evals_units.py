@@ -1125,8 +1125,8 @@ def test_config_short_answer_sync_regression():
     assert os.environ.get("RAG_EVAL_SHORT_ANSWER") == "false"
 
 
-def test_load_dataset_and_rename_file():
-    """Test that load_dataset creates test_dataset.csv and it gets renamed correctly."""
+def test_load_dataset_with_custom_name():
+    """Test that load_dataset creates the file using the custom dataset_name directly from the start."""
     old_file = Path("evals") / "datasets" / "test_dataset.csv"
     new_file = Path("evals") / "datasets" / "test_experiment_name.csv"
     
@@ -1138,21 +1138,15 @@ def test_load_dataset_and_rename_file():
     samples = [{"question": "q1", "category": "c1"}]
     with mock.patch("ragas_eval.evals._load_samples_from_source", return_value=samples):
         try:
-            # 1. Load dataset (saves as test_dataset.csv)
+            # Load dataset using a custom name
             evals.load_dataset(
                 limit=1,
                 datasource="hotpotqa",
                 limit_per_category=None,
-                questions_path="dummy.jsonl"
+                questions_path="dummy.jsonl",
+                dataset_name="test_experiment_name"
             )
-            assert old_file.exists()
-            
-            # 2. Simulate renaming logic in main()
-            experiment_name = "test_experiment_name"
-            if old_file.exists():
-                renamed_path = Path("evals") / "datasets" / f"{experiment_name}.csv"
-                old_file.rename(renamed_path)
-                
+            # The custom-named file should exist, but the default test_dataset.csv should not
             assert not old_file.exists()
             assert new_file.exists()
             

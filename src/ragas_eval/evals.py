@@ -1105,12 +1105,12 @@ def load_dataset(
     datasource: Optional[str] = None,
     limit_per_category: Optional[int] = None,
     questions_path: Optional[str] = None,
+    dataset_name: str = "test_dataset",
 ):
     """Loads dataset for evaluation based on the configured datasource type and limit."""
     if not datasource:
         raise ValueError("datasource must be specified.")
     datasource_type = datasource.lower()
-    dataset_name = "test_dataset"
 
     dataset = Dataset(
         name=dataset_name,
@@ -1754,6 +1754,14 @@ async def main():
     # 1. Load configuration (resolving CLI args and environment variables in a single place)
     config = load_configuration(args)
 
+    # Generate experiment name early to name the dataset file from the start
+    datasource_name = config.get("ragas_datasource")
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if isinstance(datasource_name, str) and datasource_name.strip():
+        experiment_name = f"{datasource_name.strip()}_{now_str}"
+    else:
+        experiment_name = now_str
+
     # 2. Validate path if using enterprise_rag_bench or model evaluation is enabled
     _validate_questions_path(config)
 
@@ -1763,18 +1771,12 @@ async def main():
         datasource=config["ragas_datasource"],
         limit_per_category=config["limit_per_category"],
         questions_path=config["questions_path"],
+        dataset_name=experiment_name,
     )
     logger.info(f"Dataset loaded successfully: {dataset}")
 
     # 4. Initialize evaluator using the pre-filtered dataset and consolidated configuration
     init_evaluator(config, dataset=dataset)
-
-    datasource_name = config.get("ragas_datasource")
-    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if isinstance(datasource_name, str) and datasource_name.strip():
-        experiment_name = f"{datasource_name.strip()}_{now_str}"
-    else:
-        experiment_name = now_str
 
     try:
         logger.info("\n--- PHASE 1: RUNNING RAG PIPELINE GENERATION ---")
@@ -1854,14 +1856,7 @@ async def main():
             datasource=datasource_name,
         )
 
-        # Rename the dataset CSV to match the experiment name
-        old_dataset_path = Path("evals") / "datasets" / "test_dataset.csv"
-        if old_dataset_path.exists():
-            new_dataset_path = Path("evals") / "datasets" / f"{experiment_name}.csv"
-            await asyncio.to_thread(old_dataset_path.rename, new_dataset_path)
-            logger.info(
-                f"Dataset renamed to match experiment: {new_dataset_path.resolve()}"
-            )
+
     finally:
         cleanup_evaluator()
 
