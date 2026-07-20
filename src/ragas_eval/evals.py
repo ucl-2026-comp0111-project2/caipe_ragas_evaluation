@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import List, Dict, Any, cast, Optional, Tuple
 import argparse
 
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    RetryCallState,
+)
 
 from openai import OpenAI
 import openai.resources.chat.completions
@@ -35,12 +41,22 @@ from ragas.metrics import (  # noqa: E402
     ContextRecall,
     SemanticSimilarity,
 )
-from ragas_eval.metrics import ContainsAnswer  # noqa: E402
+from ragas_eval.metrics import ( # noqa: E402
+    ContainsAnswer,
+    MeanReciprocalRank,
+    NDCGAtK
+)
 
 # Add the current directory to the path so we can import rag module when run as a script
 sys.path.insert(0, str(Path(__file__).parent))
 from ragas_eval.rag import default_rag_client  # noqa: E402
 from ragas_eval.agentic_rag import default_agentic_rag_client  # noqa: E402
+
+# Import unified tree-propagation callback structures
+from ragas_eval.callbacks import ( # noqa: E402
+    RowLevelTokenCallbackHandler,
+    AsyncRowLevelTokenCallbackHandler
+)
 
 # Global evaluation components (initialized via init_evaluator)
 openai_client: Any = None
@@ -58,6 +74,10 @@ ragas_completion_tokens = 0
 # Global list to collect Ragas evaluator LLM call traces
 ragas_llm_traces = []
 
+# Global callback handlers for per-row token tracking
+ragas_sync_handler = RowLevelTokenCallbackHandler()
+ragas_async_handler = AsyncRowLevelTokenCallbackHandler()
+
 GENERATED_STATEMENT_REASON = "Generated statement"
 
 # Import consolidated configuration settings
@@ -66,6 +86,21 @@ from ragas_eval.config import settings  # noqa: E402
 # Resolved configuration state for callbacks
 rag_eval_retrieval_only: Optional[bool] = None
 rag_eval_top_k: Optional[int] = None
+
+
+def is_transient_error(retry_state: RetryCallState) -> bool:
+    """Helper to catch transient errors using Tenacity's modern RetryCallState,
+    including temporary 403 replication/auth lag."""
+    if retry_state.outcome is None or not retry_state.outcome.failed:
+        return False
+
+    exception = retry_state.outcome.exception()
+    if isinstance(exception, (openai.PermissionDeniedError, openai.APIStatusError)):
+        status_code = getattr(exception, "status_code", None)
+        if status_code in (403, 429, 500, 502, 503, 504):
+            return True
+
+    return False
 
 
 def _sanitize_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,7 +162,6 @@ def _parse_json_content(content: str) -> tuple[Optional[Any], Optional[str]]:
     import json_repair
     import json
 
-    # Try parsing the original content first to preserve valid escaped internal quotes
     repaired_content = json_repair.repair_json(content)
     try:
         parsed = json.loads(repaired_content)
@@ -136,7 +170,6 @@ def _parse_json_content(content: str) -> tuple[Optional[Any], Optional[str]]:
     except Exception:
         pass
 
-    # Fallback to unescaping structural quotes only if the original parsing fails
     unescaped = content.replace('\\\\"', '"').replace('\\"', '"')
     repaired_content = json_repair.repair_json(unescaped)
     try:
@@ -181,23 +214,12 @@ def _clean_keys(obj: Any) -> Any:
 
 
 def _sanitize_values(obj: Any) -> Any:
-    """Recursively sanitizes values, mapping truthy/yes/supported strings or booleans to 1 and others to 0 for binary metrics."""
+    """Recursively sanitizes values, mapping truthy/yes strings or booleans to 1 and others to 0."""
     if isinstance(obj, dict):
         new_dict = {}
         for k, v in obj.items():
             if k in ("verdict", "attributed"):
-                if v in (
-                    1,
-                    "1",
-                    True,
-                    "true",
-                    "yes",
-                    "Yes",
-                    "supported",
-                    "Supported",
-                    "support",
-                    "Support",
-                ):
+                if v in (1, "1", True, "true", "yes", "Yes", "supported", "Supported", "support", "Support"):
                     new_dict[k] = 1
                 else:
                     new_dict[k] = 0
@@ -233,7 +255,7 @@ def _fill_dict_standard_keys(obj: Dict[str, Any]) -> None:
 def _fill_missing_keys(
     obj: Any, expected_top_level: Optional[str], is_nli: bool
 ) -> Any:
-    """Recursively checks and fills missing expected keys with default values to prevent schema validation failures."""
+    """Recursively checks and fills missing expected keys with default values."""
     if isinstance(obj, dict):
         is_statement_item = "statement" in obj or (
             expected_top_level in ("statements", "classifications") and is_nli
@@ -254,11 +276,7 @@ def _normalize_claims(parsed: List[Any]) -> Dict[str, List[Any]]:
     """Normalize a parsed list when claims are expected."""
     return {
         "claims": [
-            (
-                item.get("claim", item.get("statement", item))
-                if isinstance(item, dict)
-                else item
-            )
+            (item.get("claim", item.get("statement", item)) if isinstance(item, dict) else item)
             for item in parsed
         ]
     }
@@ -334,17 +352,13 @@ def _normalize_list_structure(
 def _rename_top_level_key(
     parsed: Dict[str, Any], expected_top_level: Optional[str]
 ) -> None:
-    """Rename any existing statements/claims/classifications list key to the expected key if it's not present."""
+    """Rename any existing statements list key to the expected key."""
     if not expected_top_level:
         return
     current_keys = list(parsed.keys())
     if expected_top_level not in current_keys:
         for k in current_keys:
-            if k in (
-                "statements",
-                "claims",
-                "classifications",
-            ) and isinstance(parsed[k], list):
+            if k in ("statements", "claims", "classifications") and isinstance(parsed[k], list):
                 parsed[expected_top_level] = parsed.pop(k)
                 break
 
@@ -356,11 +370,7 @@ def _normalize_dict_claims(parsed: Dict[str, Any]) -> None:
     claims_list = parsed["claims"]
     if isinstance(claims_list, list):
         parsed["claims"] = [
-            (
-                item.get("claim", item.get("statement", str(item)))
-                if isinstance(item, dict)
-                else str(item)
-            )
+            (item.get("claim", item.get("statement", str(item))) if isinstance(item, dict) else str(item))
             for item in claims_list
         ]
 
@@ -449,12 +459,8 @@ def _log_original_json(
     except Exception:
         pretty_original = content
 
-    logger.debug(
-        f"\n[RAGAS_EVALUATOR_LLM_PATCH] Expected Schema: {expected_top_level!r} (is_nli={is_nli})"
-    )
-    logger.debug(
-        f"[RAGAS_EVALUATOR_LLM_PATCH] Original content (JSON):\n{pretty_original}"
-    )
+    logger.debug(f"\n[RAGAS_EVALUATOR_LLM_PATCH] Expected Schema: {expected_top_level!r} (is_nli={is_nli})")
+    logger.debug(f"[RAGAS_EVALUATOR_LLM_PATCH] Original content (JSON):\n{pretty_original}")
 
 
 def _normalize_json_response(
@@ -484,9 +490,7 @@ def _normalize_json_response(
         except Exception:
             logger.exception("[RAGAS_EVALUATOR_LLM_PATCH] Normalisation error")
 
-    logger.debug(
-        f"[RAGAS_EVALUATOR_LLM_PATCH] Mapped & Repaired content (JSON):\n{json.dumps(parsed, indent=2)}"
-    )
+    logger.debug(f"[RAGAS_EVALUATOR_LLM_PATCH] Mapped & Repaired content (JSON):\n{json.dumps(parsed, indent=2)}")
     return repaired_content
 
 
@@ -501,7 +505,6 @@ def _sanitize_for_json(val: Any) -> Any:
     if isinstance(val, (str, int, float, bool, type(None))):
         return val
     try:
-        # Check if json serializable
         json.dumps(val)
         return val
     except TypeError:
@@ -563,8 +566,14 @@ def _add_llm_trace(
     ragas_llm_traces.append(_sanitize_for_json(trace))
 
 
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=is_transient_error,
+)
 def patched_ragas_evaluator_llm_create(*args, **kwargs):
-    """Intercepts and patches Ragas evaluator LLM calls to handle schema normalisation, token tracking, and trace logging."""
+    """Intercepts and patches Ragas evaluator LLM calls to handle schema normalisation and trace logging."""
     kwargs = _sanitize_kwargs(kwargs)
     messages = kwargs.get("messages", [])
     expected_top_level, is_nli = _detect_expected_schema(messages)
@@ -590,10 +599,8 @@ def patched_ragas_evaluator_llm_create(*args, **kwargs):
             is_json = s_stripped.startswith(("{", "[", "`"))
             if is_json:
                 parsed, _ = _parse_json_content(content)
-                json_parse_success = (parsed is not None)
-                repaired_content = _normalize_json_response(
-                    content, expected_top_level, is_nli
-                )
+                json_parse_success = parsed is not None
+                repaired_content = _normalize_json_response(content, expected_top_level, is_nli)
                 response.choices[0].message.content = repaired_content
 
     _add_llm_trace(
@@ -608,8 +615,14 @@ def patched_ragas_evaluator_llm_create(*args, **kwargs):
     return response
 
 
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=is_transient_error,
+)
 async def patched_ragas_evaluator_llm_async_create(*args, **kwargs):
-    """Intercepts and patches Ragas async evaluator LLM calls to handle schema normalisation, token tracking, and trace logging."""
+    """Intercepts and patches Ragas async evaluator LLM calls to handle schema normalisation."""
     kwargs = _sanitize_kwargs(kwargs)
     messages = kwargs.get("messages", [])
     expected_top_level, is_nli = _detect_expected_schema(messages)
@@ -635,10 +648,8 @@ async def patched_ragas_evaluator_llm_async_create(*args, **kwargs):
             is_json = s_stripped.startswith(("{", "[", "`"))
             if is_json:
                 parsed, _ = _parse_json_content(content)
-                json_parse_success = (parsed is not None)
-                repaired_content = _normalize_json_response(
-                    content, expected_top_level, is_nli
-                )
+                json_parse_success = parsed is not None
+                repaired_content = _normalize_json_response(content, expected_top_level, is_nli)
                 response.choices[0].message.content = repaired_content
 
     _add_llm_trace(
@@ -654,8 +665,7 @@ async def patched_ragas_evaluator_llm_async_create(*args, **kwargs):
 
 
 def load_configuration(args) -> Dict[str, Any]:
-    """Consolidates configuration from CLI args, environment, and settings.
-    Does NOT mutate the global settings variable."""
+    """Consolidates configuration from CLI args, environment, and settings."""
     questions_path = (
         args.questions_path
         or os.environ.get("QUESTIONS_PATH")
@@ -669,41 +679,21 @@ def load_configuration(args) -> Dict[str, Any]:
 
     config = {
         "questions_path": questions_path,
-        "openai_api_key": args.openai_api_key
-        or os.environ.get("OPENAI_API_KEY")
-        or settings.openai_api_key,
-        "openai_endpoint": args.openai_endpoint
-        or os.environ.get("OPENAI_ENDPOINT")
-        or settings.openai_endpoint,
-        "openai_model_name": args.openai_model_name
-        or os.environ.get("OPENAI_MODEL_NAME")
-        or settings.openai_model_name,
-        "embeddings_model": args.embeddings_model
-        or os.environ.get("EMBEDDINGS_MODEL")
-        or settings.embeddings_model,
-        "caipe_datasource_id": args.datasource
-        or os.environ.get("CAIPE_DATASOURCE_ID")
-        or settings.caipe_datasource_id,
+        "openai_api_key": args.openai_api_key or os.environ.get("OPENAI_API_KEY") or settings.openai_api_key,
+        "openai_endpoint": args.openai_endpoint or os.environ.get("OPENAI_ENDPOINT") or settings.openai_endpoint,
+        "openai_model_name": args.openai_model_name or os.environ.get("OPENAI_MODEL_NAME") or settings.openai_model_name,
+        "embeddings_model": args.embeddings_model or os.environ.get("EMBEDDINGS_MODEL") or settings.embeddings_model,
+        "caipe_datasource_id": args.datasource or os.environ.get("CAIPE_DATASOURCE_ID") or settings.caipe_datasource_id,
         "ragas_datasource": datasource,
-        "rag_eval_top_k": (
-            args.top_k if args.top_k is not None else settings.rag_eval_top_k
-        ),
-        "limit_per_category": (
-            args.limit_per_category
-            if args.limit_per_category is not None
-            else settings.limit_per_category
-        ),
+        "rag_eval_top_k": (args.top_k if args.top_k is not None else settings.rag_eval_top_k),
+        "limit_per_category": (args.limit_per_category if args.limit_per_category is not None else settings.limit_per_category),
         "ragas_limit": args.limit if args.limit is not None else settings.ragas_limit,
-        "rag_eval_retrieval_only": args.retrieval_only
-        or settings.rag_eval_retrieval_only,
-        "rag_eval_generation_only": args.generation_only
-        or settings.rag_eval_generation_only,
-        "rag_eval_short_answer": getattr(args, "short_answer", False)
-        or settings.rag_eval_short_answer,
+        "rag_eval_retrieval_only": args.retrieval_only or settings.rag_eval_retrieval_only,
+        "rag_eval_generation_only": args.generation_only or settings.rag_eval_generation_only,
+        "rag_eval_short_answer": getattr(args, "short_answer", False) or settings.rag_eval_short_answer,
         "compute_model_eval": getattr(args, "compute_model_eval", False),
         "agentic": getattr(args, "agentic", False),
-        "agent_api_url": getattr(args, "agent_api_url", None)
-        or settings.caipe_agent_api_url,
+        "agent_api_url": getattr(args, "agent_api_url", None) or settings.caipe_agent_api_url,
         "agent_api_timeout": getattr(args, "agent_api_timeout", 120.0),
         "trace_log": getattr(args, "enable_trace_log", False),
     }
@@ -717,7 +707,6 @@ def _resolve_and_sync_config(args_or_config: Any) -> Dict[str, Any]:
     else:
         config = load_configuration(args_or_config)
 
-    # Synchronize settings back to os.environ for third-party tools
     os.environ["QUESTIONS_PATH"] = config["questions_path"] or ""
     os.environ["OPENAI_API_KEY"] = config["openai_api_key"]
     os.environ["OPENAI_ENDPOINT"] = config["openai_endpoint"]
@@ -727,15 +716,9 @@ def _resolve_and_sync_config(args_or_config: Any) -> Dict[str, Any]:
     os.environ["CAIPE_QUERY_ENDPOINT"] = settings.caipe_query_endpoint
     os.environ["RAGAS_DATASOURCE"] = config["ragas_datasource"]
     os.environ["RAG_EVAL_TOP_K"] = str(config["rag_eval_top_k"])
-    os.environ["RAG_EVAL_RETRIEVAL_ONLY"] = str(
-        config["rag_eval_retrieval_only"]
-    ).lower()
-    os.environ["RAG_EVAL_GENERATION_ONLY"] = str(
-        config["rag_eval_generation_only"]
-    ).lower()
-    os.environ["RAG_EVAL_SHORT_ANSWER"] = str(
-        config.get("rag_eval_short_answer", False)
-    ).lower()
+    os.environ["RAG_EVAL_RETRIEVAL_ONLY"] = str(config["rag_eval_retrieval_only"]).lower()
+    os.environ["RAG_EVAL_GENERATION_ONLY"] = str(config["rag_eval_generation_only"]).lower()
+    os.environ["RAG_EVAL_SHORT_ANSWER"] = str(config.get("rag_eval_short_answer", False)).lower()
     return config
 
 
@@ -747,45 +730,51 @@ def _init_patched_openai_client(config: Dict[str, Any]) -> tuple[OpenAI, Any]:
         timeout=None,
         default_headers={"drop_params": "true"},
     )
-    
+
     global original_create, original_async_create
-    
-    # Patch globally on the class level so that both sync and async clients created
-    # by LangChain / Ragas internally are intercepted and tracked
-    if openai.resources.chat.completions.Completions.create != patched_ragas_evaluator_llm_create:
+
+    if (
+        openai.resources.chat.completions.Completions.create != patched_ragas_evaluator_llm_create
+    ):
         original_create = openai.resources.chat.completions.Completions.create
         openai.resources.chat.completions.Completions.create = patched_ragas_evaluator_llm_create
-        
-    if openai.resources.chat.completions.AsyncCompletions.create != patched_ragas_evaluator_llm_async_create:
+
+    if (
+        openai.resources.chat.completions.AsyncCompletions.create != patched_ragas_evaluator_llm_async_create
+    ):
         original_async_create = openai.resources.chat.completions.AsyncCompletions.create
         openai.resources.chat.completions.AsyncCompletions.create = patched_ragas_evaluator_llm_async_create
-        
+
     return client, original_create
 
 
 def cleanup_evaluator():
     """Restores original patched client behaviors and resets globals."""
     global openai_client, original_create, original_async_create, rag_client, ragas_llm, ragas_embeddings, metrics
-    
+    global ragas_sync_handler, ragas_async_handler
+    global run_id_2_row_idx, parent_run_id_2_row_idx
+
     if original_create is not None:
         openai.resources.chat.completions.Completions.create = original_create
         original_create = None
     if original_async_create is not None:
         openai.resources.chat.completions.AsyncCompletions.create = original_async_create
         original_async_create = None
-        
+
     openai_client = None
     rag_client = None
     ragas_llm = None
     ragas_embeddings = None
     metrics = []
+    
+    ragas_sync_handler = None
+    ragas_async_handler = None
 
 
 def _init_rag_client(
     config: Dict[str, Any], dataset: Optional[Dataset], openai_client: OpenAI
 ) -> Any:
     """Initialize the RAG client based on compute_model_eval flag."""
-    # Agentic mode: route through caipe-supervisor A2A endpoint
     if config.get("agentic"):
         return default_agentic_rag_client(
             logdir="evals/logs",
@@ -812,9 +801,7 @@ def _init_rag_client(
 
     questions_path = config["questions_path"]
     if not questions_path:
-        raise ValueError(
-            "questions_path must be specified when compute_model_eval is enabled."
-        )
+        raise ValueError("questions_path must be specified when compute_model_eval is enabled.")
     if not os.path.exists(questions_path):
         raise FileNotFoundError(f"Questions file not found: {questions_path}")
     return PrecomputedRAG(dataset_path=questions_path)
@@ -897,12 +884,7 @@ def _configure_ragas_llm_args(ragas_llm: Any, model_name: str) -> None:
 def _init_metrics(
     config: Dict[str, Any], ragas_llm: Any, ragas_embeddings: Any
 ) -> List[Any]:
-    """Initialize Ragas metrics based on run mode flags.
-
-    Pass --short-answer for HotpotQA-style datasets with single-word/phrase references.
-    This retains all baseline metrics (FactualCorrectness, Faithfulness, AnswerRelevancy,
-    ContextPrecision, ContextRecall) and adds SemanticSimilarity and ContainsAnswer.
-    """
+    """Initialize Ragas metrics based on run mode flags."""
     retrieval_only = config["rag_eval_retrieval_only"]
     generation_only = config["rag_eval_generation_only"]
     short_answer = config.get("rag_eval_short_answer", False)
@@ -911,6 +893,8 @@ def _init_metrics(
         return [
             ContextPrecision(llm=ragas_llm),
             ContextRecall(llm=ragas_llm),
+            MeanReciprocalRank(),
+            NDCGAtK(),
         ]
     if generation_only:
         base_metrics = [
@@ -918,10 +902,12 @@ def _init_metrics(
             AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
         ]
         if short_answer:
-            base_metrics.extend([
-                SemanticSimilarity(embeddings=ragas_embeddings),
-                ContainsAnswer(),
-            ])
+            base_metrics.extend(
+                [
+                    SemanticSimilarity(embeddings=ragas_embeddings),
+                    ContainsAnswer(),
+                ]
+            )
         return base_metrics
 
     base_metrics = [
@@ -930,48 +916,45 @@ def _init_metrics(
         AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings),
         ContextPrecision(llm=ragas_llm),
         ContextRecall(llm=ragas_llm),
+        MeanReciprocalRank(),
+        NDCGAtK(),
     ]
     if short_answer:
-        base_metrics.extend([
-            SemanticSimilarity(embeddings=ragas_embeddings),
-            ContainsAnswer(),
-        ])
+        base_metrics.extend(
+            [
+                SemanticSimilarity(embeddings=ragas_embeddings),
+                ContainsAnswer(),
+            ]
+        )
     return base_metrics
 
 
 def init_evaluator(args_or_config: Any, dataset: Optional[Dataset] = None):
-    """Initializes global evaluation settings, clients, LLMs, embeddings, and metrics based on consolidated config."""
+    """Initializes global evaluation settings, clients, LLMs, embeddings, and metrics."""
     global openai_client, original_create, rag_client, ragas_llm, ragas_embeddings, metrics
     global rag_eval_retrieval_only, rag_eval_top_k
     global ragas_prompt_tokens, ragas_completion_tokens, ragas_llm_traces
+    global ragas_sync_handler, ragas_async_handler
 
-    # Reset token counters for a fresh run
     ragas_prompt_tokens = 0
     ragas_completion_tokens = 0
     ragas_llm_traces = []
-
+    
     config = _resolve_and_sync_config(args_or_config)
 
-    # 1. Store execution state for callbacks
     rag_eval_retrieval_only = config["rag_eval_retrieval_only"]
     rag_eval_top_k = config["rag_eval_top_k"]
 
-    # 2. Setup OpenAI client
     openai_client, original_create = _init_patched_openai_client(config)
-
-    # 3. Setup RAG client
     rag_client = _init_rag_client(config, dataset, openai_client)
 
-    # 4. Configure Ragas LLM with explicit input and output constraints
     model_name_val = config["openai_model_name"]
     base_url = config["openai_endpoint"]
     ragas_llm = cast(Any, llm_factory(model=model_name_val, base_url=base_url))
 
-    # 5. Patch LLM and configure arguments
     _patch_bedrock_anthropic_llm(ragas_llm, model_name_val)
     _configure_ragas_llm_args(ragas_llm, model_name_val)
 
-    # 6. Initialize embeddings and metrics
     ragas_embeddings = cast(
         BaseRagasEmbedding,
         embedding_factory(model=config["embeddings_model"], client=openai_client),
@@ -1024,7 +1007,6 @@ def load_hotpotqa(jsonl_path: Path) -> list[dict[str, Any]]:
     return data_samples
 
 
-
 def load_mock_dataset() -> list[dict[str, Any]]:
     """Loads a mock/fallback dataset for simple testing"""
     return [
@@ -1058,9 +1040,7 @@ def _load_samples_from_source(
     """Loads raw data samples depending on the datasource type."""
     if datasource_type == "enterprise_rag_bench":
         if not questions_path:
-            raise ValueError(
-                "questions_path must be specified when using enterprise_rag_bench datasource."
-            )
+            raise ValueError("questions_path must be specified when using enterprise_rag_bench datasource.")
         jsonl_path = Path(questions_path)
         if not jsonl_path.exists():
             raise FileNotFoundError(f"Questions file not found: {jsonl_path}")
@@ -1068,9 +1048,7 @@ def _load_samples_from_source(
 
     if datasource_type == "hotpotqa":
         if not questions_path:
-            raise ValueError(
-                "questions_path must be specified when using hotpotqa datasource."
-            )
+            raise ValueError("questions_path must be specified when using hotpotqa datasource.")
         jsonl_path = Path(questions_path)
         if not jsonl_path.exists():
             raise FileNotFoundError(f"Questions file not found: {jsonl_path}")
@@ -1079,9 +1057,7 @@ def _load_samples_from_source(
     if datasource_type == "mock":
         return load_mock_dataset()
 
-    raise ValueError(
-        f"Unsupported datasource: {datasource_type!r}. Only 'enterprise_rag_bench', 'hotpotqa', or 'mock' is supported."
-    )
+    raise ValueError(f"Unsupported datasource: {datasource_type!r}.")
 
 
 def _filter_samples_by_category(
@@ -1099,7 +1075,6 @@ def _filter_samples_by_category(
             filtered_samples.append(sample)
             category_counts[cat] = count + 1
     return filtered_samples
-
 
 
 def load_dataset(
@@ -1121,11 +1096,9 @@ def load_dataset(
     )
 
     data_samples = _load_samples_from_source(datasource_type, questions_path)
-
     if not data_samples:
         raise ValueError(f"No questions loaded from datasource: {datasource_type}")
 
-    # Filter by category limit if configured
     if limit_per_category is not None:
         data_samples = _filter_samples_by_category(data_samples, limit_per_category)
 
@@ -1141,24 +1114,19 @@ def load_dataset(
 
 @experiment()
 async def run_experiment(row):
-    """
-    Phase 1: Run your RAG client pipeline exclusively.
-    Do not run evaluations inside this individual row loop.
-    """
-
+    """Phase 1: Run your RAG client pipeline exclusively."""
     retrieval_only = (
-        rag_eval_retrieval_only
-        if rag_eval_retrieval_only is not None
-        else settings.rag_eval_retrieval_only
+        rag_eval_retrieval_only if rag_eval_retrieval_only is not None else settings.rag_eval_retrieval_only
     )
     start_time = time.time()
-
     top_k_val = (
         rag_eval_top_k if rag_eval_top_k is not None else settings.rag_eval_top_k
     )
 
     if retrieval_only:
-        retrieved_docs = rag_client.retrieve_documents(row["question"], top_k=top_k_val) or []
+        retrieved_docs = (
+            rag_client.retrieve_documents(row["question"], top_k=top_k_val) or []
+        )
         latency = time.time() - start_time
         retrieved_contexts = [doc["content"] for doc in retrieved_docs]
         retrieved_doc_ids = [
@@ -1210,100 +1178,38 @@ async def run_experiment(row):
 
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments for evaluation."""
-    import argparse
-
     parser = argparse.ArgumentParser(description="Run Ragas evaluations")
-    parser.add_argument(
-        "--limit", type=int, default=None, help="Limit number of questions to evaluate"
-    )
-    parser.add_argument(
-        "--datasource", type=str, default=None, help="Override active datasource"
-    )
-    parser.add_argument(
-        "--top-k", type=int, default=None, help="Override top_k documents to retrieve"
-    )
-    parser.add_argument(
-        "--openai-api-key", type=str, default=None, help="OpenAI/LiteLLM API key"
-    )
-    parser.add_argument(
-        "--openai-endpoint", type=str, default=None, help="OpenAI/LiteLLM endpoint URL"
-    )
-    parser.add_argument(
-        "--openai-model-name", type=str, default=None, help="Model name for generation"
-    )
-    parser.add_argument(
-        "--embeddings-model", type=str, default=None, help="Model name for embeddings"
-    )
-    parser.add_argument(
-        "--retrieval-only", action="store_true", help="Run retrieval evaluation only"
-    )
-    parser.add_argument(
-        "--generation-only", action="store_true", help="Run generation evaluation only"
-    )
-    parser.add_argument(
-        "--limit-per-category",
-        type=int,
-        default=None,
-        help="Limit number of questions to evaluate per category",
-    )
-    parser.add_argument(
-        "--questions-path",
-        type=str,
-        default=None,
-        help="Path to benchmark questions JSONL dataset",
-    )
-    parser.add_argument(
-        "--compute-model-eval",
-        action="store_true",
-        help="Use PrecomputedRAG to evaluate pre-existing model answers and contexts in the datasource",
-    )
-    parser.add_argument(
-        "--enable-trace-log",
-        action="store_true",
-        help="Capture the raw agentic SSE stream logs in a separate file (agentic_run_{run_id}.log)",
-    )
-    parser.add_argument(
-        "--short-answer",
-        action="store_true",
-        help="Use SemanticSimilarity + ContainsAnswer (for HotpotQA-style short-answer datasets)",
-    )
-    parser.add_argument(
-        "--agentic",
-        action="store_true",
-        help="Use AgenticRAG — routes queries through caipe-supervisor's A2A endpoint "
-        "instead of rag-server directly. Requires the rag_context patch applied to "
-        "agent.py in your CAIPE instance.",
-    )
-    parser.add_argument(
-        "--agent-api-url",
-        default=None,
-        help="Override the agent API endpoint URL (default: CAIPE_AGENT_API_URL env or http://localhost:8000).",
-    )
-    parser.add_argument(
-        "--agent-api-timeout",
-        type=float,
-        default=120.0,
-        help="HTTP timeout in seconds for calls to the agent API (default: 120.0).",
-    )
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of questions to evaluate")
+    parser.add_argument("--datasource", type=str, default=None, help="Override active datasource")
+    parser.add_argument("--top-k", type=int, default=None, help="Override top_k documents to retrieve")
+    parser.add_argument("--openai-api-key", type=str, default=None, help="OpenAI/LiteLLM API key")
+    parser.add_argument("--openai-endpoint", type=str, default=None, help="OpenAI/LiteLLM endpoint URL")
+    parser.add_argument("--openai-model-name", type=str, default=None, help="Model name for generation")
+    parser.add_argument("--embeddings-model", type=str, default=None, help="Model name for embeddings")
+    parser.add_argument("--retrieval-only", action="store_true", help="Run retrieval evaluation only")
+    parser.add_argument("--generation-only", action="store_true", help="Run generation evaluation only")
+    parser.add_argument("--limit-per-category", type=int, default=None, help="Limit number of questions to evaluate per category")
+    parser.add_argument("--questions-path", type=str, default=None, help="Path to benchmark questions JSONL dataset")
+    parser.add_argument("--compute-model-eval", action="store_true", help="Use PrecomputedRAG to evaluate pre-existing model answers")
+    parser.add_argument("--enable-trace-log", action="store_true", help="Capture raw agentic SSE stream logs")
+    parser.add_argument("--short-answer", action="store_true", help="Use SemanticSimilarity + ContainsAnswer hooks")
+    parser.add_argument("--agentic", action="store_true", help="Route queries through caipe-supervisor's A2A endpoint")
+    parser.add_argument("--agent-api-url", default=None, help="Override active agent endpoint address")
+    parser.add_argument("--agent-api-timeout", type=float, default=120.0, help="HTTP connection timeout windows")
+    parser.add_argument("--debug", action="store_true", help="Enable debug level logging")
     return parser.parse_args()
 
 
 def _validate_questions_path(config: Dict[str, Any]) -> None:
     """Validate path if using enterprise_rag_bench, hotpotqa or model evaluation is enabled."""
     datasource_type = config["ragas_datasource"].lower()
-    if (
-        datasource_type in ("enterprise_rag_bench", "hotpotqa")
-        or config["compute_model_eval"]
-    ):
+    if datasource_type in ("enterprise_rag_bench", "hotpotqa") or config["compute_model_eval"]:
         questions_path = config["questions_path"]
         if not questions_path:
-            raise ValueError(
-                "questions_path must be specified (via CLI --questions-path or env QUESTIONS_PATH) "
-                "when using enterprise_rag_bench, hotpotqa or compute_model_eval."
-            )
+            raise ValueError("questions_path must be explicitly configured for enterprise workloads.")
         path_obj = Path(questions_path)
         if not path_obj.exists():
-            raise FileNotFoundError(f"Questions file not found: {path_obj}")
+            raise FileNotFoundError(f"Questions file not found target direction boundary: {path_obj}")
 
 
 def _prepare_eval_dataset(df: pd.DataFrame) -> EvaluationDataset:
@@ -1315,12 +1221,20 @@ def _prepare_eval_dataset(df: pd.DataFrame) -> EvaluationDataset:
         logger.debug(f"  Response: {r['response']!r}")
         logger.debug(f"  Retrieved Contexts: {r['retrieved_contexts']}")
         logger.debug(f"  Reference: {r['reference']!r}")
+
+        # Convert lists to JSON strings to safely populate the rubrics contract
+        serialized_ids = {
+            "retrieved_doc_ids": json.dumps(r.get("retrieved_doc_ids", [])),
+            "expected_doc_ids": json.dumps(r.get("expected_doc_ids", []))
+        }
+
         samples.append(
             SingleTurnSample(
                 user_input=r["question"],
                 response=r["response"],
                 retrieved_contexts=r["retrieved_contexts"],
                 reference=r["reference"],
+                rubrics=serialized_ids,
             )
         )
     return EvaluationDataset(samples=samples)
@@ -1330,23 +1244,16 @@ def _extract_statements(val: Any) -> List[Any]:
     """Safely extracts statements list from n_l_i_statement_prompt output (dict or Pydantic)."""
     if not isinstance(val, dict):
         return []
-
     prompt_data = val.get("n_l_i_statement_prompt")
     if not isinstance(prompt_data, dict):
         return []
-
     output_obj = prompt_data.get("output")
     if not output_obj:
         return []
-
-    # If output_obj is a Pydantic model / custom object
     if hasattr(output_obj, "statements"):
         return getattr(output_obj, "statements") or []
-
-    # If output_obj is a dict
     if isinstance(output_obj, dict):
         return output_obj.get("statements") or []
-
     return []
 
 
@@ -1360,12 +1267,10 @@ def _run_evaluation(
     """Run Ragas evaluate metrics across the dataset and update scores."""
     from ragas import RunConfig
 
-    # Update embedding on answer relevancy metric to use wrapped object
     for m in metrics_list:
         if hasattr(m, "embeddings"):
             m.embeddings = legacy_embeddings
 
-    # Pre-initialize all metric columns to 0.0 to prevent KeyError in case of job failures
     metric_names = [m.name for m in metrics_list]
     for col in metric_names:
         df[col] = 0.0
@@ -1380,27 +1285,19 @@ def _run_evaluation(
             embeddings=legacy_embeddings,
             run_config=RunConfig(timeout=cast(Any, None), max_workers=1),
             show_progress=True,
+            callbacks=[h for h in [ragas_sync_handler, ragas_async_handler] if h is not None],
         )
 
-        # Merge the evaluation scores back into our tracking DataFrame
         scores_df = cast(Any, results).to_pandas()
 
-        # Clean up column layout boundaries for merging operational behaviors
         for col in metric_names:
-            matching_cols = [
-                c for c in scores_df.columns if c == col or c.startswith(f"{col}(")
-            ]
+            matching_cols = [c for c in scores_df.columns if c == col or c.startswith(f"{col}(")]
             if matching_cols:
                 df[col] = scores_df[matching_cols[0]].values
 
-        # Extract reasons from traces if available
-        reasons_dict: Dict[str, List[str]] = {
-            "faithfulness": [],
-            "factual_correctness": []
-        }
+        reasons_dict: Dict[str, List[str]] = {"faithfulness": [], "factual_correctness": []}
         traces = getattr(results, "traces", [])
         for trace in traces:
-            # 1. Faithfulness reasoning
             faith_reason = ""
             if "faithfulness" in trace:
                 statements = _extract_statements(trace["faithfulness"])
@@ -1408,18 +1305,13 @@ def _run_evaluation(
                     faith_reasons_list = []
                     for stmt in statements:
                         if isinstance(stmt, dict):
-                            verdict = stmt.get("verdict")
-                            statement = stmt.get("statement")
-                            reason = stmt.get("reason")
+                            verdict, statement, reason = stmt.get("verdict"), stmt.get("statement"), stmt.get("reason")
                         else:
-                            verdict = getattr(stmt, "verdict", None)
-                            statement = getattr(stmt, "statement", None)
-                            reason = getattr(stmt, "reason", None)
+                            verdict, statement, reason = getattr(stmt, "verdict", None), getattr(stmt, "statement", None), getattr(stmt, "reason", None)
                         faith_reasons_list.append(f"[{verdict}] {statement} -> {reason}")
                     faith_reason = "; ".join(faith_reasons_list)
             reasons_dict["faithfulness"].append(faith_reason)
 
-            # 2. Factual correctness reasoning
             fc_reason = ""
             if "factual_correctness" in trace:
                 statements = _extract_statements(trace["factual_correctness"])
@@ -1427,13 +1319,9 @@ def _run_evaluation(
                     fc_reasons_list = []
                     for stmt in statements:
                         if isinstance(stmt, dict):
-                            verdict = stmt.get("verdict")
-                            statement = stmt.get("statement")
-                            reason = stmt.get("reason")
+                            verdict, statement, reason = stmt.get("verdict"), stmt.get("statement"), stmt.get("reason")
                         else:
-                            verdict = getattr(stmt, "verdict", None)
-                            statement = getattr(stmt, "statement", None)
-                            reason = getattr(stmt, "reason", None)
+                            verdict, statement, reason = getattr(stmt, "verdict", None), getattr(stmt, "statement", None), getattr(stmt, "reason", None)
                         fc_reasons_list.append(f"[{verdict}] {statement} -> {reason}")
                     fc_reason = "; ".join(fc_reasons_list)
             reasons_dict["factual_correctness"].append(fc_reason)
@@ -1443,8 +1331,7 @@ def _run_evaluation(
         if "factual_correctness" in metric_names and len(reasons_dict["factual_correctness"]) == len(df):
             df["factual_correctness_reason"] = reasons_dict["factual_correctness"]
     except Exception as e:
-        logger.exception(f"Error during Ragas evaluate execution: {e}")
-        # Fallback to 0.0 for all metrics on failure
+        logger.exception(f"Error during Ragas evaluate execution sequence: {e}")
         for col in metric_names:
             df[col] = 0.0
 
@@ -1458,37 +1345,31 @@ def _analyze_failures(df: pd.DataFrame) -> Tuple[float, float]:
 
     df["failure_cause"] = "none"
     if "factual_correctness" in df.columns:
-        df.loc[df["factual_correctness"] < 0.5, "failure_cause"] = (
-            "incorrect_generation"
-        )
+        df.loc[df["factual_correctness"] < 0.5, "failure_cause"] = "incorrect_generation"
     if "faithfulness" in df.columns:
         df.loc[df["faithfulness"] < 0.5, "failure_cause"] = "hallucination"
     if "context_recall" in df.columns:
         df.loc[df["context_recall"] < 0.5, "failure_cause"] = "poor_retrieval"
 
-    recalls = []
-    precisions = []
+    recalls, precisions = [], []
     for _, r in df.iterrows():
         expected = set(r.get("expected_doc_ids") or [])
         retrieved = set(r.get("retrieved_doc_ids") or [])
         if expected:
             hit = expected & retrieved
-            recall = len(hit) / len(expected)
-            precision = len(hit) / len(retrieved) if retrieved else 0.0
-            recalls.append(recall)
-            precisions.append(precision)
+            recalls.append(len(hit) / len(expected))
+            precisions.append(len(hit) / len(retrieved) if retrieved else 0.0)
         else:
             recalls.append(None)
             precisions.append(None)
+            
     df["retrieval_recall"] = recalls
     df["retrieval_precision"] = precisions
     valid_recalls = [r for r in recalls if r is not None]
     valid_precisions = [p for p in precisions if p is not None]
 
     avg_recall = sum(valid_recalls) / len(valid_recalls) if valid_recalls else 0.0
-    avg_precision = (
-        sum(valid_precisions) / len(valid_precisions) if valid_precisions else 0.0
-    )
+    avg_precision = sum(valid_precisions) / len(valid_precisions) if valid_precisions else 0.0
     return avg_recall, avg_precision
 
 
@@ -1498,22 +1379,10 @@ def _calculate_llm_parsing_stats() -> Dict[str, int]:
     total_calls = len(ragas_llm_traces)
     api_errors = sum(1 for t in ragas_llm_traces if t.get("error") is not None)
     successful_calls = total_calls - api_errors
-    empty_responses = sum(
-        1 for t in ragas_llm_traces 
-        if t.get("error") is None and t.get("original_content") is None
-    )
-    json_parse_success_count = sum(
-        1 for t in ragas_llm_traces if t.get("json_parse_success") is True
-    )
-    json_parse_failure_count = sum(
-        1 for t in ragas_llm_traces if t.get("json_parse_success") is False
-    )
-    non_json_responses = sum(
-        1 for t in ragas_llm_traces 
-        if t.get("error") is None 
-        and t.get("original_content") is not None 
-        and t.get("json_parse_success") is None
-    )
+    empty_responses = sum(1 for t in ragas_llm_traces if t.get("error") is None and t.get("original_content") is None)
+    json_parse_success_count = sum(1 for t in ragas_llm_traces if t.get("json_parse_success") is True)
+    json_parse_failure_count = sum(1 for t in ragas_llm_traces if t.get("json_parse_success") is False)
+    non_json_responses = sum(1 for t in ragas_llm_traces if t.get("error") is None and t.get("original_content") is not None and t.get("json_parse_success") is None)
     return {
         "total_calls": total_calls,
         "api_errors": api_errors,
@@ -1534,21 +1403,12 @@ def _log_metrics_summary(
     evaluation_time: float,
 ) -> None:
     """Log configuration and summary metrics."""
-    keys_to_print = [
-        "ragas_datasource",
-        "rag_eval_top_k",
-        "rag_eval_retrieval_only",
-        "rag_eval_generation_only",
-        "limit_per_category",
-        "compute_model_eval",
-        "rag_eval_short_answer",
-    ]
+    keys_to_print = ["ragas_datasource", "rag_eval_top_k", "rag_eval_retrieval_only", "rag_eval_generation_only", "limit_per_category", "compute_model_eval", "rag_eval_short_answer"]
 
     logger.info("\n--- RUN CONFIGURATION ---")
     for k in keys_to_print:
         if k in config:
-            print_key = k.replace("rag_eval_", "").replace("ragas_", "")
-            logger.info(f"{print_key}: {config[k]}")
+            logger.info(f"{k.replace('rag_eval_', '').replace('ragas_', '')}: {config[k]}")
 
     logger.info("\n--- OPERATIONAL BEHAVIOR ---")
     logger.info("RAG Pipeline:")
@@ -1556,89 +1416,65 @@ def _log_metrics_summary(
         logger.info(f"  P50 Latency: {df['latency'].median():.2f}s")
         logger.info(f"  P95 Latency: {df['latency'].quantile(0.95):.2f}s")
     else:
-        logger.info("  P50 Latency: 0.00s")
-        logger.info("  P95 Latency: 0.00s")
-        
-    if not df.empty and "total_tokens" in df.columns:
-        logger.info(f"  Total Tokens: {int(df['total_tokens'].sum())}")
-    else:
-        logger.info("  Total Tokens: 0")
-        
-    logger.info("")
-    logger.info("Ragas Evaluator:")
-    logger.info(f"  Evaluation Time: {evaluation_time:.2f}s")
+        logger.info("  P50 Latency: 0.00s\n  P95 Latency: 0.00s")
+
+    logger.info(f"  Total Tokens: {int(df['total_tokens'].sum()) if (not df.empty and 'total_tokens' in df.columns) else 0}")
+    logger.info(f"\nRagas Evaluator:\n  Evaluation Time: {evaluation_time:.2f}s")
+    
     total_ragas_tokens = ragas_prompt_tokens + ragas_completion_tokens
-    logger.info(f"  Prompt Tokens: {ragas_prompt_tokens}")
-    logger.info(f"  Completion Tokens: {ragas_completion_tokens}")
-    logger.info(f"  Total Evaluator Tokens: {total_ragas_tokens}")
+    logger.info(f"  Prompt Tokens: {ragas_prompt_tokens}\n  Completion Tokens: {ragas_completion_tokens}\n  Total Evaluator Tokens: {total_ragas_tokens}")
 
     stats = _calculate_llm_parsing_stats()
     logger.info("\n--- EVALUATOR LLM PARSING & QUALITY STATS ---")
-    logger.info(f"  Total LLM Calls: {stats['total_calls']}")
-    logger.info(f"  Successful LLM Responses: {stats['successful_calls']}")
-    logger.info(f"  API/Connection Errors: {stats['api_errors']}")
-    logger.info(f"  Empty Choices/Responses: {stats['empty_responses']}")
-    logger.info(f"  Successful JSON Parses: {stats['json_parse_success']}")
-    logger.info(f"  JSON Parsing/Repair Failures: {stats['json_parse_failures']}")
-    logger.info(f"  Plain Text / Non-JSON Responses: {stats['non_json_responses']}")
+    logger.info(f"  Total LLM Calls: {stats['total_calls']}\n  Successful LLM Responses: {stats['successful_calls']}\n  API/Connection Errors: {stats['api_errors']}")
+    logger.info(f"  Empty Choices/Responses: {stats['empty_responses']}\n  Successful JSON Parses: {stats['json_parse_success']}")
+    logger.info(f"  JSON Parsing/Repair Failures: {stats['json_parse_failures']}\n  Plain Text / Non-JSON Responses: {stats['non_json_responses']}")
 
     logger.info("\n--- QUALITY METRICS AVERAGE ---")
     for m in metric_names:
-        avg_val = df[m].mean() if (not df.empty and m in df.columns) else 0.0
-        logger.info(f"Average {m}: {avg_val:.2f}")
+        logger.info(f"Average {m}: {df[m].mean() if (not df.empty and m in df.columns) else 0.0:.2f}")
 
-    valid_recalls = [r for r in df["retrieval_recall"] if r is not None] if (not df.empty and "retrieval_recall" in df.columns) else []
-    if valid_recalls:
+    if not df.empty and "retrieval_recall" in df.columns and any(r is not None for r in df["retrieval_recall"]):
         logger.info(f"Average retrieval_recall: {avg_recall:.2f}")
-
-    valid_precisions = [p for p in df["retrieval_precision"] if p is not None] if (not df.empty and "retrieval_precision" in df.columns) else []
-    if valid_precisions:
+    if not df.empty and "retrieval_precision" in df.columns and any(p is not None for p in df["retrieval_precision"]):
         logger.info(f"Average retrieval_precision: {avg_precision:.2f}")
 
-    logger.info("\n--- FAILURE CAUSE ANALYSIS ---")
-    if not df.empty and "failure_cause" in df.columns:
-        logger.info(f"\n{df['failure_cause'].value_counts()}")
-    else:
-        logger.info("\nNo failure cause data available.")
+    logger.info(f"\n--- FAILURE CAUSE ANALYSIS ---\n{df['failure_cause'].value_counts() if (not df.empty and 'failure_cause' in df.columns) else 'No failure data available.'}")
 
 
 def _extract_json_from_prompt(prompt_text: str) -> Optional[Dict[str, Any]]:
     """Helper to extract JSON input from prompt text, ignoring few-shot examples."""
-    matches = list(re.finditer(r'(?:input|Input|INPUT):\s*\{', prompt_text))
+    matches = list(re.finditer(r"(?:input|Input|INPUT):\s*\{", prompt_text))
     if not matches:
         return None
-    
-    last_match = matches[-1]
-    start_idx = last_match.end() - 1
-    depth = 0
-    end_idx = -1
+    start_idx = matches[-1].end() - 1
+    depth, end_idx = 0, -1
     for i in range(start_idx, len(prompt_text)):
-        char = prompt_text[i]
-        if char == '{':
-            depth += 1
-        elif char == '}':
+        if prompt_text[i] == "{": depth += 1
+        elif prompt_text[i] == "}":
             depth -= 1
             if depth == 0:
                 end_idx = i + 1
                 break
     if end_idx != -1:
-        try:
-            return json.loads(prompt_text[start_idx:end_idx])
-        except Exception:
-            pass
+        try: return json.loads(prompt_text[start_idx:end_idx])
+        except Exception: pass
     return None
 
 
 def _safe_parse_list(val: Any) -> List[str]:
-    """Helper to parse a list from string representation in DataFrames."""
-    if not val or pd.isna(val):
-        return []
-    if isinstance(val, list):
-        return val
-    try:
-        return ast.literal_eval(val)
-    except Exception:
-        return [str(val)]
+    """Helper to parse a list from string representation safely."""
+    if isinstance(val, list): return [str(item) for item in val]
+    if hasattr(val, "tolist"): return [str(item) for item in val.tolist()]
+    if val is None or pd.isna(val) or not val: return []
+    if isinstance(val, str):
+        if val.strip().startswith("[") and val.strip().endswith("]"):
+            try:
+                parsed = ast.literal_eval(val.strip())
+                if isinstance(parsed, list): return [str(item) for item in parsed]
+            except Exception: pass
+        return [val]
+    return [str(val)]
 
 
 async def _save_evaluation_outputs(
@@ -1651,109 +1487,56 @@ async def _save_evaluation_outputs(
     evaluation_time: float,
     datasource: Optional[str],
 ) -> None:
-    """Save the results DataFrame to CSV and companion JSON summary asynchronously."""
+    """Save results DataFrame and companion validation files asynchronously."""
     global ragas_prompt_tokens, ragas_completion_tokens
+    global ragas_sync_handler, ragas_async_handler
+    
     output_dir = Path(".") / "evals" / "experiments"
     output_dir.mkdir(exist_ok=True)
     csv_path = output_dir / f"{experiment_name}.csv"
 
-    # Copy DataFrame to avoid modifying caller's data
     df = df.copy()
-
-    # Initialize per-row token counters in df
+    df["ragas_row_run_id"] = "N/A"
+    df["ragas_batch_run_id"] = "N/A"
     df["evaluator_prompt_tokens"] = 0
     df["evaluator_completion_tokens"] = 0
     df["evaluator_total_tokens"] = 0
     df["evaluator_evaluation_time_seconds"] = evaluation_time
 
-    # Match and attribute trace token usage back to individual rows
-    for trace in ragas_llm_traces:
-        usage = trace.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        p_tokens = usage.get("prompt_tokens", 0)
-        c_tokens = usage.get("completion_tokens", 0)
+    logger.debug("\n--- Populating Ragas Evaluator Token Usage ---")
+    
+    # Track if any valid row metrics are located during verification passes
+    populated_any = False
 
-        # Concatenate prompt message content to check for substrings
-        prompt_text = " ".join(
-            [
-                m.get("content", "")
-                for m in trace.get("messages", [])
-                if isinstance(m, dict)
-            ]
-        )
+    # Safely aggregate token counts and trace fields sequentially from both handlers
+    for h_instance in [ragas_sync_handler, ragas_async_handler]:
+        if h_instance and getattr(h_instance, "row_2_run_id_token", None):
+            if h_instance.row_2_run_id_token:
+                populated_any = True
+                for idx in df.index:
+                    usage = h_instance.get_row_usage(idx)
+                    
+                    # Accumulate token metrics across both instances
+                    df.at[idx, "evaluator_prompt_tokens"] += usage.get("evaluator_prompt_tokens", 0)
+                    df.at[idx, "evaluator_completion_tokens"] += usage.get("evaluator_completion_tokens", 0)
+                    df.at[idx, "evaluator_total_tokens"] += usage.get("evaluator_total_tokens", 0)
+                    
+                    # Store trace identity bounds if valid references are extracted
+                    if usage.get("ragas_row_run_id") and usage["ragas_row_run_id"] != "N/A":
+                        df.at[idx, "ragas_row_run_id"] = usage["ragas_row_run_id"]
+                    if usage.get("ragas_batch_run_id") and usage["ragas_batch_run_id"] != "N/A":
+                        df.at[idx, "ragas_batch_run_id"] = usage["ragas_batch_run_id"]
 
-        input_data = _extract_json_from_prompt(prompt_text)
+    if not populated_any:
+        logger.warning("No Ragas token usage entries found. Tracking columns will retain default placeholder metrics.")
 
-        best_idx = None
-        best_score = 0
-
-        inp_q = input_data.get("question") if input_data else None
-        inp_ans = (input_data.get("response") or input_data.get("answer")) if input_data else None
-        inp_ref = input_data.get("reference") if input_data else None
-        inp_ctx = input_data.get("context") if input_data else None
-
-        for idx, row in df.iterrows():
-            q = row.get("question")
-            ans = row.get("response")
-            ref = row.get("reference")
-            contexts = _safe_parse_list(row.get("retrieved_contexts"))
-
-            score = 0
-
-            if input_data:
-                # Question match
-                if inp_q and q and str(inp_q).strip() == str(q).strip():
-                    score += 2000
-                # Response/Answer match (check both ans and ref since Ragas swaps them)
-                if inp_ans:
-                    if ans and str(inp_ans).strip() == str(ans).strip():
-                        score += 1500
-                    if ref and str(inp_ans).strip() == str(ref).strip():
-                        score += 1500
-                # Reference match (check both ans and ref)
-                if inp_ref:
-                    if ref and str(inp_ref).strip() == str(ref).strip():
-                        score += 1500
-                    if ans and str(inp_ref).strip() == str(ans).strip():
-                        score += 1500
-                # Context match (check retrieved contexts, response, and reference)
-                if inp_ctx:
-                    if ans and str(inp_ctx).strip() == str(ans).strip():
-                        score += 1200
-                    if ref and str(inp_ctx).strip() == str(ref).strip():
-                        score += 1200
-                    for ctx in contexts:
-                        if ctx and len(str(ctx)) > 20 and str(ctx).strip() in str(inp_ctx):
-                            score += 1000
-
-            # Substring fallback
-            if q and len(str(q)) > 10 and str(q) in prompt_text:
-                score += 500
-            if ans and len(str(ans)) > 10 and str(ans) in prompt_text:
-                score += 300
-            if ref and len(str(ref)) > 10 and str(ref) in prompt_text:
-                score += 300
-            for ctx in contexts:
-                if ctx and len(str(ctx)) > 20 and str(ctx) in prompt_text:
-                    score += 400
-
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-
-        if best_idx is not None:
-            df.at[best_idx, "evaluator_prompt_tokens"] += p_tokens
-            df.at[best_idx, "evaluator_completion_tokens"] += c_tokens
-            df.at[best_idx, "evaluator_total_tokens"] += p_tokens + c_tokens
-
-    # Create a summary row with overall averages
     summary_row: dict[str, Any] = dict.fromkeys(df.columns, "")
     summary_row["question"] = "AVERAGE_METRICS"
     summary_row["latency"] = df["latency"].mean() if (not df.empty and "latency" in df.columns) else 0.0
     summary_row["total_tokens"] = df["total_tokens"].mean() if (not df.empty and "total_tokens" in df.columns) else 0.0
     for m in metric_names:
         summary_row[m] = df[m].mean() if (not df.empty and m in df.columns) else 0.0
+        
     summary_row["retrieval_recall"] = avg_recall
     summary_row["retrieval_precision"] = avg_precision
     summary_row["failure_cause"] = "N/A"
@@ -1794,7 +1577,6 @@ async def _save_evaluation_outputs(
     def save_json():
         with open(summary_json_path, "w") as f:
             json.dump(summary_data, f, indent=4)
-
         traces_path = Path(".") / "evals" / "logs" / f"{experiment_name}_evaluator_traces.json"
         traces_path.parent.mkdir(parents=True, exist_ok=True)
         with open(traces_path, "w") as f:
@@ -1806,51 +1588,33 @@ async def _save_evaluation_outputs(
 
 
 class LegacyEmbeddingsWrapper:
-    """Wrapper class to adapt Ragas embeddings to LangChain-compatible interface expected by legacy metrics."""
-
+    """Wrapper class to adapt Ragas embeddings to LangChain interface mappings."""
     def __init__(self, emb: Any):
-        """Initializes LegacyEmbeddingsWrapper with the underlying embedding model."""
         self.emb = emb
-
-    def embed_query(self, text: str) -> List[float]:
-        """Embeds a single query string into a vector."""
-        return self.emb.embed_text(text)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Embeds a list of document strings into a list of vectors."""
-        return self.emb.embed_texts(texts)
-
-    def embed_text(self, text: str) -> List[float]:
-        """Adapt to modern BaseRagasEmbedding interface."""
-        return self.emb.embed_text(text)
-
+    def embed_query(self, text: str) -> List[float]: return self.emb.embed_text(text)
+    def embed_documents(self, texts: List[str]) -> List[List[float]]: return self.emb.embed_texts(texts)
+    def embed_text(self, text: str) -> List[float]: return self.emb.embed_text(text)
     async def aembed_text(self, text: str) -> List[float]:
-        """Adapt to modern BaseRagasEmbedding async interface, falling back to sync if client lacks async support."""
-        try:
-            return await self.emb.aembed_text(text)
-        except (TypeError, AttributeError):
-            return self.emb.embed_text(text)
+        try: return await self.emb.aembed_text(text)
+        except (TypeError, AttributeError): return self.emb.embed_text(text)
 
 
 async def main():
-    """Main function to parse CLI arguments, run RAG generation, and evaluate results using Ragas metrics."""
+    """Main function execution engine mapping generation bounds and evaluating outputs."""
     args = _parse_args()
-
-    # 1. Load configuration (resolving CLI args and environment variables in a single place)
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled successfully.")
+        
     config = load_configuration(args)
 
-    # Generate experiment name early to name the dataset file from the start
     datasource_name = config.get("ragas_datasource")
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if isinstance(datasource_name, str) and datasource_name.strip():
-        experiment_name = f"{datasource_name.strip()}_{now_str}"
-    else:
-        experiment_name = now_str
+    prefix = "precomputed_" if config.get("compute_model_eval") else ""
+    experiment_name = f"{prefix}{datasource_name.strip()}_{now_str}" if (isinstance(datasource_name, str) and datasource_name.strip()) else f"{prefix}{now_str}"
 
-    # 2. Validate path if using enterprise_rag_bench or model evaluation is enabled
     _validate_questions_path(config)
-
-    # 3. Load dataset first (this reads the file once and applies limits/filters)
     dataset = load_dataset(
         limit=config["ragas_limit"],
         datasource=config["ragas_datasource"],
@@ -1860,22 +1624,18 @@ async def main():
     )
     logger.info(f"Dataset loaded successfully: {dataset}")
 
-    # 4. Initialize evaluator using the pre-filtered dataset and consolidated configuration
     init_evaluator(config, dataset=dataset)
 
     try:
         logger.info("\n--- PHASE 1: RUNNING RAG PIPELINE GENERATION ---")
         experiment_results = await run_experiment.arun(dataset, name=experiment_name)
-
-        # Convert generated results directly into a pandas frame
         df = pd.DataFrame(experiment_results)
 
         logger.info("\n--- PHASE 2: BATCH EVALUATION VIA RAGAS ---")
+        authoritative_frame = df.copy() # Safe authoritative alignment backup layout
         eval_dataset = _prepare_eval_dataset(df)
-
         legacy_embeddings: Any = LegacyEmbeddingsWrapper(ragas_embeddings)
 
-        # Run batch evaluation smoothly outside of active async worker threads
         logger.info("Evaluating metrics across whole dataset...")
         start_eval_time = time.time()
         metric_names = _run_evaluation(
@@ -1886,23 +1646,16 @@ async def main():
             ragas_llm_obj=ragas_llm,
         )
         evaluation_time = time.time() - start_eval_time
-
         avg_recall, avg_precision = _analyze_failures(df)
 
-        _log_metrics_summary(
-            config, df, metric_names, avg_recall, avg_precision, evaluation_time
-        )
+        _log_metrics_summary(config, df, metric_names, avg_recall, avg_precision, evaluation_time)
 
-        config_args = {
-            k: v for k, v in vars(args).items() if v is not None and k != "openai_api_key"
-        }
+        config_args = {k: v for k, v in vars(args).items() if v is not None and k != "openai_api_key"}
 
-        # Combine detailed log files if they exist
         combined_log_path_str = " "
         if "log_file" in df.columns:
             log_files = df["log_file"].dropna().unique()
-            valid_log_files = []
-            combined_logs = []
+            valid_log_files, combined_logs = [], []
             for lf in log_files:
                 lf_str = str(lf).strip()
                 if lf_str and lf_str != "N/A" and os.path.exists(lf_str):
@@ -1921,12 +1674,9 @@ async def main():
                 logger.info(f"Combined detailed logs saved to: {combined_log_path.resolve()}")
                 combined_log_path_str = str(combined_log_path)
 
-                # Clean up the individual log files
                 for lf_str in valid_log_files:
-                    try:
-                        os.remove(lf_str)
-                    except Exception as e:
-                        logger.warning(f"Failed to delete individual log file {lf_str}: {e}")
+                    try: os.remove(lf_str)
+                    except Exception as e: logger.warning(f"Failed to delete log artifact: {e}")
 
         df["log_file"] = combined_log_path_str
 
@@ -1940,16 +1690,12 @@ async def main():
             evaluation_time=evaluation_time,
             datasource=datasource_name,
         )
-
-
     finally:
         cleanup_evaluator()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
